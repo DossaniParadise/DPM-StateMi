@@ -1,0 +1,1354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DPM ReceiptMi — Card Statement Receipts</title>
+<meta name="apple-mobile-web-app-title" content="ReceiptMi" />
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://static.filestackapi.com/filestack-js/3.x.x/filestack.min.js"></script>
+<!-- pdf.js renders statement pages to a canvas; Tesseract.js reads them. Both run
+     entirely in the browser — the statement never leaves the user's machine
+     except for the Filestack upload of the original PDF. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+<style>
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .snip { image-rendering: auto; border: 1px solid #e2e8f0; border-radius: 6px; background: #fff; }
+  .row-done   { background: #f0fdf4; }
+  .row-skip   { background: #f8fafc; color: #64748b; }
+  .row-review { background: #fffbeb; }
+  .hovercard  { pointer-events: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spin { animation: spin 1s linear infinite; }
+  .thumb { width: 96px; height: 96px; object-fit: cover; border-radius: 8px; border: 1px solid #e2e8f0; background: #f8fafc; }
+  .thumb-lg { width: 128px; height: 128px; }
+  input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; }
+  .progress-bar { transition: width .3s ease; }
+  @media (hover: none) { .hovercard { display: none; } }
+</style>
+</head>
+<body class="bg-slate-100">
+
+<div id="root" class="min-h-screen"></div>
+
+<!-- ============================================================
+     CONFIG — same conventions as PayMi (window.APP_CONFIG)
+     ============================================================ -->
+<script>
+window.APP_CONFIG = {
+  version: "1.0",
+
+  // Firestore — same project as PayMi. This app only touches the
+  // `cc_statements` collection (and its `lines` sub-collection).
+  firebase: {
+    apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
+    authDomain: "gen-lang-client-0357067758.firebaseapp.com",
+    projectId: "gen-lang-client-0357067758",
+    storageBucket: "gen-lang-client-0357067758.firebasestorage.app",
+    messagingSenderId: "169864973972",
+    appId: "1:169864973972:web:e68c48e1faaa11e21aae81"
+  },
+  statementsCollection: "cc_statements",
+
+  // Filestack — public key, same as PayMi. Lock it down with domain/referrer
+  // restrictions in the Filestack dashboard. Files are stored under
+  //   /statements/<statement id>/statement.pdf          (the original)
+  //   /statements/<statement id>/<line id>/<file>       (receipts)
+  filestackApiKey: "Afe1LdETdKFIBOgrA4TgLz",
+  filestackBasePath: "/statements/",
+
+  // Directory / alignment API (read-only; resolves who can sign in)
+  directoryUrl: "https://alignment-api-khaki.vercel.app/api/dpm-alignment",
+
+  // --- Identity: email + role password, identical model to PayMi -----------
+  rolePasswords: {
+    admin:    "Overwatch@76051",
+    vp:       "VP@76051",
+    finance:  "AP@76051",
+    director: "DO@76051",
+    coach:    "DM@76051",
+    manager:  "Dossani@76051"
+  },
+  adminEmails: ["itsupport@dossaniparadise.com"],
+  vp: { name: "Sam Merchant", email: "Sam@dossaniparadise.com" },
+  financeUsers: [
+    { email: "kathreen@dossaniparadise.com", name: "Kathreen Mourad" },
+    { email: "aali@dossaniparadise.com",     name: "Anwer Ali" },
+    { email: "anila@dossaniparadise.com",    name: "Anila Dossani" },
+    { email: "husain@dossaniparadise.com",   name: "Husain Virani" },
+    { email: "jkhoja@dossaniparadise.com",   name: "Jennifer Khoja" },
+    { email: "tony@dossaniparadise.com",     name: "Tony Varghese" }
+  ],
+
+  // Who may upload/delete statements. Everyone who can sign in may attach
+  // receipts, add notes and mark lines "no receipt needed".
+  managerRoles: ["ADMIN", "FINANCE", "VP"],
+
+  // --- OCR -------------------------------------------------------------------
+  ocr: {
+    renderScale: 2.6,          // pdf.js scale (~190dpi). Higher = slower, more accurate.
+    snipWidth: 1100,           // px width of the per-line image crop saved with each line
+    snipQuality: 0.72,
+    // Lines matching these are auto-marked "no receipt needed" at import.
+    autoNoReceipt: [
+      /payment\s*-?\s*thank you/i, /mobile payment/i, /autopay/i,
+      /membership fee/i, /annual fee/i, /interest charge/i, /late fee/i
+    ]
+  }
+};
+</script>
+
+<script type="module">
+import { initializeApp }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import {
+  initializeFirestore, collection, doc, addDoc, updateDoc, deleteDoc, setDoc, getDocs,
+  writeBatch, onSnapshot, query, orderBy, serverTimestamp, arrayUnion
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const app = initializeApp(window.APP_CONFIG.firebase);
+const db  = initializeFirestore(app, { experimentalAutoDetectLongPolling: true });
+window.FS = { db, collection, doc, addDoc, updateDoc, deleteDoc, setDoc, getDocs,
+              writeBatch, onSnapshot, query, orderBy, serverTimestamp, arrayUnion };
+window.dispatchEvent(new Event("firebase-ready"));
+</script>
+
+<script>
+/* ------------------------------------------------------------------
+   STATEMENT PARSER — pure functions, shared by the Node test and the app.
+   Input: OCR words with bounding boxes for ONE page.
+     word = { text, x0, y0, x1, y1, conf }
+   Output: { rows, items, meta }
+     rows  = [{ y, text, words }]              every visual text row
+     items = [{ date, desc, amount, page, y0, y1 }]  parsed charge lines
+   ------------------------------------------------------------------ */
+(function (root) {
+
+  // Group words into visual rows by vertical centre. Two words belong to the
+  // same row when their centres differ by less than ~60% of the median word
+  // height on the page. Words are then sorted left-to-right.
+  function wordsToRows(words) {
+    const ws = words.filter(w => w.text && w.text.trim());
+    if (!ws.length) return [];
+    const hs = ws.map(w => w.y1 - w.y0).sort((a, b) => a - b);
+    const medH = hs[Math.floor(hs.length / 2)] || 10;
+    const tol = Math.max(4, medH * 0.6);
+    const sorted = ws.slice().sort((a, b) => ((a.y0 + a.y1) - (b.y0 + b.y1)));
+    const rows = [];
+    sorted.forEach(w => {
+      const cy = (w.y0 + w.y1) / 2;
+      const r = rows[rows.length - 1];
+      if (r && Math.abs(cy - r.cy) <= tol) {
+        r.words.push(w);
+        r.cy = (r.cy * (r.words.length - 1) + cy) / r.words.length;
+      } else rows.push({ cy, words: [w] });
+    });
+    return rows.map(r => {
+      r.words.sort((a, b) => a.x0 - b.x0);
+      return {
+        y: r.cy,
+        y0: Math.min(...r.words.map(w => w.y0)),
+        y1: Math.max(...r.words.map(w => w.y1)),
+        x0: Math.min(...r.words.map(w => w.x0)),
+        text: r.words.map(w => w.text).join(" ").replace(/\s+/g, " ").trim(),
+        words: r.words
+      };
+    });
+  }
+
+  // OCR confuses a few glyphs in dates and amounts; normalise before matching.
+  function fixDigits(s) {
+    return s.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1").replace(/S/g, "5").replace(/B/g, "8");
+  }
+
+  // Cosmetic OCR fixes for the description column.
+  function cleanDesc(d) {
+    return (d || "")
+      .replace(/^[\s|\-—–_.,:;'"`]+/, "")
+      .replace(/(^|\s)1?T?™X?(?=\s|$)/g, "$1TX").replace(/\s1X$/, " TX")
+      .replace(/Ap\|IPay|Ap[l1|]Pay/g, "AplPay")
+      .replace(/\s+/g, " ").trim()
+      .replace(/\b([A-Z]{3,})\.(?=\s|$)/g, "$1");   // OCR adds stray periods: "MAPS. EAST", "MSBILL.INFO."
+  }
+
+  const DATE_RE = /^(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{2,4})$/;
+  // "$1,234.56", "-$12.00", "$8.54 ¢" (the pay-over-time diamond OCRs as junk)
+  const AMT_RE = /^(-|—|–)?\$?\s?(\d{1,3}(?:[,.]\d{3})*|\d+)[.,](\d{2})(-)?$/;
+
+  function parseAmountToken(tok) {
+    let t = fixDigits(tok.replace(/[^\d$.,\-—–]/g, ""));
+    let m = t.match(AMT_RE);
+    if (!m && /\$/.test(tok)) {
+      // "$5.41¢4": the pay-over-time diamond OCRs as junk glued to the cents.
+      const g = t.match(/^(-|—|–)?\$\s?(\d{1,3}(?:,\d{3})*|\d+)\.(\d{2})/);
+      if (g) m = [g[0], g[1], g[2], g[3], undefined];
+    }
+    if (!m) return null;
+    const whole = m[2].replace(/[,.]/g, "");
+    const val = parseFloat(whole + "." + m[3]);
+    const neg = !!(m[1] || m[4]);
+    return neg ? -val : val;
+  }
+
+  function parseDateToken(tok) {
+    const t = fixDigits(tok);
+    const m = t.match(DATE_RE);
+    if (!m) return null;
+    const mm = +m[1], dd = +m[2];
+    if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return null;
+    let yy = m[3]; if (yy.length === 4) yy = yy.slice(2);
+    return `${String(mm).padStart(2, "0")}/${String(dd).padStart(2, "0")}/${yy}`;
+  }
+
+  // Lines we never want as items even though they start with a date.
+  const SKIP_RE = /closing date|statement|account ending|arrival date|departure date|^p\.\s*\d/i;
+
+  const END_RE = /continued on|^amount$|card ending|monthly spending limit|^total|^new charges|^payments|^credits|^fees|^interest|^detail/i;
+
+  function parsePage(words, pageNo, pageWidth, startCardholder) {
+    const rows = wordsToRows(words);
+    const items = [];
+    let meta = {};
+    let current = null;
+    let cardholder = startCardholder || "";
+    let recent = [];   // last few row texts, to find the name above "Card Ending"
+    const rightEdge = pageWidth || Math.max(...rows.map(r => Math.max(...r.words.map(w => w.x1))), 1000);
+
+    rows.forEach(row => {
+      const text = row.text;
+      // --- statement metadata ---
+      let m;
+      if ((m = text.match(/closing date\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/i))) meta.closingDate = parseDateToken(m[1]) || m[1];
+      if ((m = text.match(/account ending\s*([\d\-]{5,})/i))) meta.accountEnding = m[1];
+      if ((m = text.match(/p\.\s*(\d+)\s*\/\s*(\d+)/i))) meta.pageOf = [+m[1], +m[2]];
+      if (/business (platinum|gold|green)|platinum card|gold card/i.test(text) && !meta.cardName) meta.cardName = text.replace(/\s*p\.\s*\d+\s*\/\s*\d+.*$/i, "").trim();
+      if (!meta.primaryName && rows.indexOf(row) < 6) {
+        // Header: the primary cardholder's name sits beside the Amex logo, which
+        // OCRs as "American} ..." / "EXPRESS ~Al DOSSANI". Strip the logo junk.
+        const t = text.replace(/american\}?|express|~|[^A-Za-z\s'.\-]/gi, " ").replace(/\s+/g, " ").trim();
+        if (/^[A-Za-z][A-Za-z'.\-]+(\s+[A-Za-z][A-Za-z'.\-]+){1,2}$/.test(t) &&
+            !/MGT|INC|LLC|CARD|CORP|MANAGEMENT|PARADISE|GROUP|CLOSING|AMOUNT/i.test(t)) meta.primaryName = t.toUpperCase();
+      }
+
+      // Cardholder section header: "KARIM MAWANI" / "Card Ending 9-21049 Monthly Spending Limit: $5,000"
+      if ((m = text.match(/^(.*?)\s*card ending\s*([\d\-]{4,})/i))) {
+        const looksLikeName = t => /^[A-Za-z][A-Za-z'.\-]+(\s+[A-Za-z][A-Za-z'.\-]+)+$/.test(t) && !/amount|total|continued|card/i.test(t);
+        let name = (m[1] || "").trim();
+        if (!looksLikeName(name)) name = recent.slice().reverse().find(looksLikeName) || "";
+        if (name) {
+          cardholder = name;
+          // The name row was probably swallowed as a continuation of the item above.
+          items.forEach(it => { it.extra = it.extra.filter(x => x !== name); });
+        }
+        current = null; recent.push(text); recent = recent.slice(-4); return;
+      }
+      if (END_RE.test(text)) { current = null; recent.push(text); recent = recent.slice(-4); return; }
+      recent.push(text); recent = recent.slice(-4);
+      if (SKIP_RE.test(text) && !/^\d/.test(text)) return;
+
+      const ws = row.words;
+      const date = parseDateToken(ws[0].text);
+      // "08/16/26 08/20/26" (lodging arrival/departure) — every token is a date: continuation, not an item.
+      const allDates = ws.every(w => parseDateToken(w.text));
+      // Amount must be the LAST token and sit in the right ~30% of the page.
+      const last = ws[ws.length - 1];
+      let amount = null, amtIdx = -1;
+      for (let i = ws.length - 1; i >= Math.max(0, ws.length - 3); i--) {
+        const a = parseAmountToken(ws[i].text);
+        if (a !== null && ws[i].x0 > rightEdge * 0.68) { amount = a; amtIdx = i; break; }
+      }
+      // "-$12.00" sometimes OCRs as "- $12.00" or "$12.00 -": handle a lone
+      // minus token next to the amount.
+      if (amount !== null && amtIdx > 0 && /^[-—–]$/.test(ws[amtIdx - 1].text)) { amount = -Math.abs(amount); amtIdx--; }
+
+      if (date && amount !== null && amtIdx >= 1 && !allDates) {
+        const descWords = ws.slice(1, amtIdx);
+        const desc = cleanDesc(descWords.map(w => w.text).join(" "));
+        if (SKIP_RE.test(desc)) { current = null; return; }
+        current = { date, desc, amount, page: pageNo, y0: row.y0, y1: row.y1, extra: [], cardholder };
+        items.push(current);
+        return;
+      }
+      if (date && amount === null && !allDates) {
+        // A dated row with no amount (OCR dropped it) — still an item, flag it.
+        const desc = cleanDesc(ws.slice(1).map(w => w.text).join(" "));
+        if (desc && !SKIP_RE.test(desc)) {
+          current = { date, desc, amount: null, page: pageNo, y0: row.y0, y1: row.y1, extra: [], needsReview: true, cardholder };
+          items.push(current);
+        }
+        return;
+      }
+      // Continuation row (phone number, "MERCHANDISE", lodging dates...) —
+      // belongs to the item above it if it is close and indented past the date column.
+      if (current && (!date || allDates) && amount === null && row.x0 > rightEdge * 0.08 &&
+          row.y0 - current.y1 < (row.y1 - row.y0) * 4.5) {
+        if (text && !SKIP_RE.test(text)) current.extra.push(text);
+        current.y1 = Math.max(current.y1, row.y1);
+        return;
+      }
+      current = null;
+    });
+
+    items.forEach(it => { it.extra = it.extra.slice(0, 6).map(cleanDesc).filter(Boolean); });
+    return { rows, items, meta, cardholder };
+  }
+
+  const api = { wordsToRows, parsePage, parseAmountToken, parseDateToken };
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
+  else root.StatementParser = api;
+})(typeof window !== "undefined" ? window : globalThis);
+
+</script>
+<script type="text/babel">
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+const CFG = window.APP_CONFIG;
+const Parser = window.StatementParser;
+
+/* ============================================================
+   0. HELPERS
+   ============================================================ */
+const money = n => (n === null || n === undefined || isNaN(n)) ? "—" :
+  (n < 0 ? "-" : "") + "$" + Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtDate = ts => {
+  if (!ts) return "";
+  const d = ts.toDate ? ts.toDate() : new Date(ts);
+  return isNaN(d) ? "" : d.toLocaleDateString();
+};
+const fmtBytes = b => !b ? "" : b > 1048576 ? (b / 1048576).toFixed(1) + " MB" : Math.round(b / 1024) + " KB";
+const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+const ROLE_LABELS = { ADMIN: "Admin", FINANCE: "Finance", VP: "VP of Ops", DIRECTOR: "Director",
+                      AREA_COACH: "District Manager", MANAGER: "Store Manager" };
+const roleLabel = r => ROLE_LABELS[r] || r || "";
+const isManager = s => !!s && CFG.managerRoles.includes(s.role);
+
+// Status of a line for filters, colours and progress.
+function lineStatus(l) {
+  if (l.noReceipt) return "skip";
+  if ((l.attachments || []).length) return "done";
+  return "todo";
+}
+
+// Filestack preview URLs. Images resize natively; PDFs and Office docs are
+// converted to a first-page JPG by Filestack's document conversion.
+function thumbUrl(att, w) {
+  if (!att || !att.handle) return "";
+  const base = "https://cdn.filestackcontent.com/";
+  const isImg = /^image\//.test(att.mimetype || "") || /\.(png|jpe?g|gif|webp|heic)$/i.test(att.name || "");
+  if (isImg) return base + "resize=width:" + w + "/" + att.handle;
+  return base + "output=format:jpg,page:1/resize=width:" + w + "/" + att.handle;
+}
+
+function cleanForFirestore(obj) {
+  if (Array.isArray(obj)) return obj.map(cleanForFirestore);
+  if (obj && typeof obj === "object" && !(obj.toDate) && obj.constructor === Object) {
+    const o = {};
+    Object.keys(obj).forEach(k => { if (obj[k] !== undefined) o[k] = cleanForFirestore(obj[k]); });
+    return o;
+  }
+  return obj;
+}
+
+function csvEscape(v) {
+  const s = (v === null || v === undefined) ? "" : String(v);
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+/* ============================================================
+   1. DIRECTORY + IDENTITY (same model as PayMi)
+   ============================================================ */
+const directoryService = {
+  async load() {
+    const bust = (CFG.directoryUrl.includes("?") ? "&" : "?") + "_=" + Date.now();
+    const res = await fetch(CFG.directoryUrl + bust, { cache: "no-store" });
+    if (!res.ok) throw new Error("Directory API " + res.status);
+    const data = await res.json();
+    const coaches = data.areaCoaches || {}, directors = data.directors || {},
+          rests = data.restaurants || {}, staff = data.vps || data.supportStaff || {};
+    const users = {};
+    Object.values(directors).forEach(d => { users[d.id] = { id: d.id, name: d.name, email: (d.email || "").trim(), role: "DIRECTOR" }; });
+    Object.values(coaches).forEach(c => { if (!users[c.id]) users[c.id] = { id: c.id, name: c.name, email: (c.email || "").trim(), role: "AREA_COACH" }; });
+    Object.values(staff).forEach(s => { if (!users[s.id]) users[s.id] = { id: s.id, name: s.name, email: (s.email || "").trim(), role: "STAFF" }; });
+    const stores = Object.values(rests).map(r => ({
+      id: r.id, name: r.storeName || "(unnamed)", storeNumber: r.storeNumber || "",
+      storeManager: r.storeManager || "", email: r.email || ""
+    }));
+    // VP: resolved by email from the live directory, config is the fallback.
+    const cfgEmail = (CFG.vp.email || "").trim().toLowerCase();
+    const vpRec = [...Object.values(staff), ...Object.values(directors), ...Object.values(coaches)]
+      .find(r => (r.email || "").trim().toLowerCase() === cfgEmail);
+    const vp = { email: cfgEmail, name: (vpRec && vpRec.name) || CFG.vp.name, id: (vpRec && vpRec.id) || ("vp:" + cfgEmail) };
+    return { users, stores, vp };
+  }
+};
+
+function resolveSession(email, pw, dir) {
+  const lc = (email || "").trim().toLowerCase();
+  if (!lc || !pw) return { error: "Enter your email and password." };
+  const P = CFG.rolePasswords;
+  const emailOf = o => (o && o.email ? o.email : "").toLowerCase();
+
+  if (CFG.adminEmails.map(e => e.toLowerCase()).includes(lc)) {
+    if (pw !== P.admin) return { error: "That password doesn't match the admin role." };
+    return { id: "admin:" + lc, email: lc, name: "IT Support", role: "ADMIN" };
+  }
+  if (dir.vp && lc === dir.vp.email && pw === P.vp)
+    return { id: dir.vp.id, email: lc, name: dir.vp.name, role: "VP" };
+
+  const dirFinance = Object.values(dir.users).find(u => emailOf(u) === lc && u.role === "FINANCE");
+  const seeded = CFG.financeUsers.find(u => u.email.toLowerCase() === lc);
+  if (dirFinance || seeded) {
+    if (pw !== P.finance) return { error: "That password doesn't match the finance role." };
+    return { id: dirFinance ? dirFinance.id : "fin:" + lc, email: lc, name: (dirFinance || seeded).name, role: "FINANCE" };
+  }
+  const director = Object.values(dir.users).find(u => emailOf(u) === lc && u.role === "DIRECTOR");
+  if (director) {
+    if (pw !== P.director) return { error: "That password doesn't match the director role." };
+    return { id: director.id, email: lc, name: director.name, role: "DIRECTOR" };
+  }
+  const coach = Object.values(dir.users).find(u => emailOf(u) === lc && u.role === "AREA_COACH");
+  if (coach) {
+    if (pw !== P.coach) return { error: "That password doesn't match the district manager role." };
+    return { id: coach.id, email: lc, name: coach.name, role: "AREA_COACH" };
+  }
+  const store = dir.stores.find(s => (s.email || "").toLowerCase() === lc);
+  if (store) {
+    if (pw !== P.manager) return { error: "That password doesn't match the store role." };
+    return { id: "store:" + store.id, email: lc, name: store.storeManager || store.name, role: "MANAGER", storeId: store.id };
+  }
+  if (dir.vp && lc === dir.vp.email) return { error: "That password doesn't match the VP role." };
+  return { error: "We couldn't find that email in the directory. Check it's the email on file." };
+}
+
+/* ============================================================
+   2. FILESTACK
+   ============================================================ */
+function useFilestack() {
+  const ref = useRef(null);
+  const [, bump] = useState(0);
+  useEffect(() => {
+    if (ref.current) return;
+    let tries = 0;
+    const t = setInterval(() => {
+      if (window.filestack && CFG.filestackApiKey) {
+        try { ref.current = window.filestack.init(CFG.filestackApiKey); bump(n => n + 1); } catch (e) {}
+        clearInterval(t);
+      } else if (++tries > 40) { clearInterval(t); bump(n => n + 1); }
+    }, 250);
+    return () => clearInterval(t);
+  }, []);
+  return ref.current;
+}
+
+function useFirebaseReady() {
+  const [ready, setReady] = useState(!!window.FS);
+  useEffect(() => {
+    if (window.FS) { setReady(true); return; }
+    const h = () => setReady(true);
+    window.addEventListener("firebase-ready", h);
+    return () => window.removeEventListener("firebase-ready", h);
+  }, []);
+  return ready;
+}
+
+/* ============================================================
+   3. OCR PIPELINE — pdf.js render → Tesseract → StatementParser
+   ============================================================ */
+async function processStatementPdf(file, { onProgress, signal }) {
+  if (!window.pdfjsLib) throw new Error("pdf.js didn't load. Check the network and reload.");
+  if (!window.Tesseract) throw new Error("Tesseract.js didn't load. Check the network and reload.");
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+  const report = (stage, pct, detail) => onProgress && onProgress({ stage, pct, detail });
+  report("Loading PDF", 2, file.name);
+  const buf = await file.arrayBuffer();
+  const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
+  const pageCount = pdf.numPages;
+
+  report("Starting OCR engine", 4, "downloading language data on first use");
+  const worker = await window.Tesseract.createWorker("eng", 1, {
+    logger: m => {
+      if (m.status === "loading tesseract core" || m.status === "loading language traineddata")
+        report("Starting OCR engine", 4 + Math.round((m.progress || 0) * 4), m.status);
+    }
+  });
+  await worker.setParameters({ preserve_interword_spaces: "1" });
+
+  const items = [], metaAll = {};
+  let cardholder = "";
+  const t0 = Date.now();
+  try {
+    for (let p = 1; p <= pageCount; p++) {
+      if (signal && signal.aborted) throw new Error("Cancelled");
+      const elapsed = (Date.now() - t0) / 1000;
+      const eta = p > 1 ? Math.round(elapsed / (p - 1) * (pageCount - p + 1)) : null;
+      report("Reading page " + p + " of " + pageCount, 8 + Math.round((p - 1) / pageCount * 90),
+             eta !== null ? "about " + (eta < 60 ? eta + "s" : Math.ceil(eta / 60) + " min") + " left" : "");
+
+      const page = await pdf.getPage(p);
+      const viewport = page.getViewport({ scale: CFG.ocr.renderScale });
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.floor(viewport.width); canvas.height = Math.floor(viewport.height);
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+
+      const { data } = await worker.recognize(canvas, {}, { blocks: true, text: false });
+      const words = [];
+      const walk = (blocks) => (blocks || []).forEach(b => (b.paragraphs || []).forEach(pg =>
+        (pg.lines || []).forEach(l => (l.words || []).forEach(w =>
+          words.push({ text: w.text, x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1, conf: w.confidence })))));
+      if (data.blocks) walk(data.blocks);
+      else if (data.words) data.words.forEach(w => words.push({ text: w.text, x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1, conf: w.confidence }));
+
+      const res = Parser.parsePage(words, p, canvas.width, cardholder);
+      cardholder = res.cardholder;
+      Object.keys(res.meta).forEach(k => { if (metaAll[k] === undefined) metaAll[k] = res.meta[k]; });
+
+      // Crop a strip of the page for every line so reviewers (and the hover
+      // card later) can see exactly what the statement printed.
+      res.items.forEach(it => {
+        const pad = Math.round((it.y1 - it.y0) * 0.12) + 3;
+        const sy = Math.max(0, it.y0 - pad), sh = Math.min(canvas.height - sy, it.y1 - it.y0 + pad * 2);
+        const sx = Math.round(canvas.width * 0.04), sw = Math.round(canvas.width * 0.92);
+        const w = Math.min(CFG.ocr.snipWidth, sw), h = Math.max(1, Math.round(sh * w / sw));
+        const c = document.createElement("canvas"); c.width = w; c.height = h;
+        c.getContext("2d").drawImage(canvas, sx, sy, sw, sh, 0, 0, w, h);
+        it.snip = c.toDataURL("image/jpeg", CFG.ocr.snipQuality);
+        delete it.y0; delete it.y1;
+        items.push(it);
+      });
+      page.cleanup();
+    }
+  } finally {
+    try { await worker.terminate(); } catch (e) {}
+  }
+  report("Done", 100, items.length + " lines found");
+  return { items, meta: metaAll, pageCount };
+}
+
+/* ============================================================
+   4. FIRESTORE SERVICE
+   ============================================================ */
+const svc = {
+  col() { return window.FS.collection(window.FS.db, CFG.statementsCollection); },
+  linesCol(sid) { return window.FS.collection(window.FS.db, CFG.statementsCollection, sid, "lines"); },
+
+  subscribeStatements(cb, onErr) {
+    const { query, orderBy, onSnapshot } = window.FS;
+    return onSnapshot(query(this.col(), orderBy("createdAt", "desc")),
+      snap => cb(snap.docs.map(d => ({ id: d.id, ...d.data() }))), onErr);
+  },
+  subscribeLines(sid, cb, onErr) {
+    const { query, orderBy, onSnapshot } = window.FS;
+    return onSnapshot(query(this.linesCol(sid), orderBy("seq", "asc")),
+      snap => cb(snap.docs.map(d => ({ id: d.id, ...d.data() }))), onErr);
+  },
+
+  async createStatement(meta, lines, session) {
+    const { doc, writeBatch, serverTimestamp } = window.FS;
+    const sref = doc(this.col());
+    const stats = this.stats(lines);
+    const batches = [];
+    let b = writeBatch(window.FS.db), n = 0;
+    b.set(sref, cleanForFirestore({
+      ...meta, lineCount: lines.length, doneCount: stats.done, skipCount: stats.skip,
+      total: stats.total, status: "ready",
+      createdBy: { id: session.id, name: session.name, email: session.email },
+      createdAt: serverTimestamp(), updatedAt: serverTimestamp()
+    }));
+    n++;
+    for (const l of lines) {
+      const lref = doc(this.linesCol(sref.id));
+      b.set(lref, cleanForFirestore({ ...l, attachments: l.attachments || [], note: l.note || "",
+        noReceipt: !!l.noReceipt, updatedAt: serverTimestamp() }));
+      if (++n >= 400) { batches.push(b.commit()); b = writeBatch(window.FS.db); n = 0; }
+    }
+    if (n) batches.push(b.commit());
+    await Promise.all(batches);
+    return sref.id;
+  },
+
+  stats(lines) {
+    const s = { done: 0, skip: 0, todo: 0, total: 0 };
+    lines.forEach(l => { s[lineStatus(l)]++; s.total += (+l.amount || 0); });
+    return s;
+  },
+
+  async updateLine(sid, lid, patch, session, allLines) {
+    const { doc, updateDoc, serverTimestamp } = window.FS;
+    await updateDoc(doc(this.linesCol(sid), lid), cleanForFirestore({
+      ...patch, updatedAt: serverTimestamp(), updatedBy: { id: session.id, name: session.name }
+    }));
+    // Keep the statement's summary counters in step so the list view is cheap.
+    if (allLines) {
+      const next = allLines.map(l => l.id === lid ? { ...l, ...patch } : l);
+      const s = this.stats(next);
+      try { await updateDoc(doc(this.col(), sid), { doneCount: s.done, skipCount: s.skip, lineCount: next.length, updatedAt: serverTimestamp() }); } catch (e) {}
+    }
+  },
+
+  async addLine(sid, line, session, allLines) {
+    const { doc, setDoc, serverTimestamp } = window.FS;
+    const lref = doc(this.linesCol(sid));
+    await setDoc(lref, cleanForFirestore({ ...line, attachments: [], note: "", noReceipt: false,
+      updatedAt: serverTimestamp(), updatedBy: { id: session.id, name: session.name } }));
+    const s = this.stats([...(allLines || []), line]);
+    try { await window.FS.updateDoc(doc(this.col(), sid), { lineCount: (allLines || []).length + 1, doneCount: s.done, skipCount: s.skip }); } catch (e) {}
+  },
+
+  async deleteLine(sid, lid, allLines) {
+    const { doc, deleteDoc, updateDoc } = window.FS;
+    await deleteDoc(doc(this.linesCol(sid), lid));
+    const next = (allLines || []).filter(l => l.id !== lid);
+    const s = this.stats(next);
+    try { await updateDoc(doc(this.col(), sid), { lineCount: next.length, doneCount: s.done, skipCount: s.skip }); } catch (e) {}
+  },
+
+  async updateStatement(sid, patch) {
+    const { doc, updateDoc, serverTimestamp } = window.FS;
+    await updateDoc(doc(this.col(), sid), cleanForFirestore({ ...patch, updatedAt: serverTimestamp() }));
+  },
+
+  async deleteStatement(sid) {
+    const { getDocs, writeBatch, doc } = window.FS;
+    const snap = await getDocs(this.linesCol(sid));
+    let b = writeBatch(window.FS.db), n = 0;
+    for (const d of snap.docs) {
+      b.delete(d.ref);
+      if (++n >= 400) { await b.commit(); b = writeBatch(window.FS.db); n = 0; }
+    }
+    b.delete(doc(this.col(), sid));
+    await b.commit();
+  }
+};
+
+/* ============================================================
+   5. SMALL UI PIECES
+   ============================================================ */
+function Toast({ toast }) {
+  if (!toast) return null;
+  const c = toast.kind === "err" ? "bg-red-600" : toast.kind === "ok" ? "bg-emerald-600" : "bg-slate-800";
+  return (
+    <div className={"fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-lg px-4 py-2 text-sm text-white shadow-lg " + c}>
+      {toast.msg}
+    </div>
+  );
+}
+function useToast() {
+  const [toast, setToast] = useState(null);
+  const timer = useRef(null);
+  const show = useCallback((msg, kind) => {
+    setToast({ msg, kind });
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => setToast(null), kind === "err" ? 6000 : 2500);
+  }, []);
+  return [toast, show];
+}
+
+function Spinner({ className }) {
+  return <span className={"inline-block h-4 w-4 rounded-full border-2 border-slate-300 border-t-slate-700 spin " + (className || "")} />;
+}
+
+function Progress({ done, skip, total, small }) {
+  const t = total || 0, d = done || 0, s = skip || 0;
+  const pd = t ? d / t * 100 : 0, ps = t ? s / t * 100 : 0;
+  return (
+    <div className={"w-full overflow-hidden rounded-full bg-slate-200 " + (small ? "h-1.5" : "h-2.5")}>
+      <div className="flex h-full">
+        <div className="progress-bar h-full bg-emerald-500" style={{ width: pd + "%" }} />
+        <div className="progress-bar h-full bg-slate-400" style={{ width: ps + "%" }} />
+      </div>
+    </div>
+  );
+}
+
+function Chip({ status }) {
+  const m = {
+    done: ["bg-emerald-100 text-emerald-800 border-emerald-200", "Attached"],
+    skip: ["bg-slate-200 text-slate-600 border-slate-300", "No receipt needed"],
+    todo: ["bg-amber-100 text-amber-800 border-amber-200", "Needs receipt"]
+  }[status];
+  return <span className={"inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] font-semibold " + m[0]}>{m[1]}</span>;
+}
+
+function AttachmentThumb({ att, size }) {
+  const [broken, setBroken] = useState(false);
+  const cls = "thumb " + (size === "lg" ? "thumb-lg" : "");
+  return (
+    <a href={att.url} target="_blank" rel="noopener" title={att.name} className="group block text-center"
+       onClick={e => e.stopPropagation()}>
+      {broken
+        ? <div className={cls + " flex items-center justify-center text-2xl"}>📄</div>
+        : <img src={thumbUrl(att, size === "lg" ? 256 : 192)} alt={att.name} className={cls} loading="lazy" onError={() => setBroken(true)} />}
+      <div className="mt-1 w-24 truncate text-[10px] text-slate-500 group-hover:text-slate-800">{att.name}</div>
+    </a>
+  );
+}
+
+/* ============================================================
+   6. LOGIN
+   ============================================================ */
+function Login({ dir, onSignIn, dirError }) {
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState("");
+  function submit(e) {
+    e && e.preventDefault(); setErr("");
+    if (!dir) { setErr("The directory hasn't loaded yet. Try again in a moment."); return; }
+    const sess = resolveSession(email, pw, dir);
+    if (sess.error) { setErr(sess.error); return; }
+    onSignIn(sess, { email: sess.email, pw });
+  }
+  return (
+    <div className="flex min-h-screen items-center justify-center p-4">
+      <form onSubmit={submit} className="w-full max-w-sm rounded-xl border bg-white p-6 shadow-sm">
+        <div className="text-[10px] font-bold uppercase tracking-widest text-[#8c909a]">DPM · ReceiptMi</div>
+        <h1 className="mt-1 text-lg font-semibold text-slate-900">Card Statement Receipts</h1>
+        <p className="mt-1 text-sm text-slate-500">Sign in with your work email and your role password.</p>
+        <label className="mt-5 block text-sm"><span className="text-slate-600">Email</span>
+          <input type="email" value={email} autoComplete="username" onChange={e => setEmail(e.target.value)}
+                 placeholder="you@dossaniparadise.com" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" /></label>
+        <label className="mt-3 block text-sm"><span className="text-slate-600">Role password</span>
+          <input type="password" value={pw} autoComplete="current-password" onChange={e => setPw(e.target.value)}
+                 placeholder="••••••••" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" /></label>
+        {(err || dirError) && <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{err || dirError}</p>}
+        <button type="submit" className="mt-4 w-full rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white">
+          {dir ? "Sign in" : <span><Spinner className="mr-2 border-slate-500 border-t-white" />Loading directory…</span>}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+/* ============================================================
+   7. STATEMENT LIST
+   ============================================================ */
+function StatementList({ statements, loading, session, onOpen, onNew, onDelete }) {
+  return (
+    <div>
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-xl font-semibold text-slate-900">Statements</h2>
+          <p className="text-sm text-slate-500">Upload a statement, then attach a receipt to every line.</p>
+        </div>
+        {isManager(session) && (
+          <button onClick={onNew} className="rounded-lg bg-[#2a5f9e] px-4 py-2 text-sm font-medium text-white hover:bg-[#234f84]">
+            + New statement
+          </button>
+        )}
+      </div>
+      {loading && <div className="rounded-xl border bg-white p-8 text-center text-sm text-slate-500"><Spinner /> Loading…</div>}
+      {!loading && !statements.length && (
+        <div className="rounded-xl border border-dashed bg-white p-10 text-center text-sm text-slate-500">
+          No statements yet. {isManager(session) ? "Click “New statement” to upload one." : "Ask Finance to upload one."}
+        </div>
+      )}
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        {statements.map(s => {
+          const open = (s.lineCount || 0) - (s.doneCount || 0) - (s.skipCount || 0);
+          return (
+            <div key={s.id} onClick={() => onOpen(s)}
+                 className="cursor-pointer rounded-xl border border-[#e0dbd3] bg-white p-4 transition hover:border-[#2a5f9e] hover:shadow-sm">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className="font-semibold text-slate-900">{s.title || "Statement"}</div>
+                  <div className="text-xs text-slate-500">
+                    {s.cardName || "Card"}{s.accountEnding ? " · ending " + s.accountEnding : ""}
+                    {s.closingDate ? " · closes " + s.closingDate : ""}
+                  </div>
+                </div>
+                {open === 0
+                  ? <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">Complete</span>
+                  : <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800">{open} open</span>}
+              </div>
+              <div className="mt-3"><Progress done={s.doneCount} skip={s.skipCount} total={s.lineCount} /></div>
+              <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
+                <span>{s.doneCount || 0} attached · {s.skipCount || 0} skipped · {s.lineCount || 0} lines</span>
+                <span>{money(s.total)}</span>
+              </div>
+              <div className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
+                <span>{s.createdBy && s.createdBy.name} · {fmtDate(s.createdAt)}</span>
+                {isManager(session) && (
+                  <button onClick={e => { e.stopPropagation(); onDelete(s); }} className="text-red-500 hover:underline">Delete</button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   8. NEW STATEMENT — pick → OCR → review → save
+   ============================================================ */
+function NewStatement({ session, fs, onDone, onCancel, toast }) {
+  const [step, setStep] = useState("pick");       // pick | working | review | saving
+  const [file, setFile] = useState(null);
+  const [prog, setProg] = useState({ stage: "", pct: 0, detail: "" });
+  const [upload, setUpload] = useState({ pct: 0, done: null, err: "" });
+  const [items, setItems] = useState([]);
+  const [meta, setMeta] = useState({ title: "", cardName: "", accountEnding: "", closingDate: "", primaryName: "" });
+  const [err, setErr] = useState("");
+  const abortRef = useRef(null);
+  const fileInput = useRef(null);
+
+  function onPick(f) {
+    if (!f) return;
+    if (f.type !== "application/pdf" && !/\.pdf$/i.test(f.name)) { setErr("Please choose a PDF statement."); return; }
+    setErr(""); setFile(f);
+  }
+
+  async function start() {
+    if (!file) return;
+    setStep("working"); setErr("");
+    const ac = new AbortController(); abortRef.current = ac;
+
+    // Upload the original PDF to Filestack in parallel with OCR.
+    const stmtId = uid();
+    const uploadP = (async () => {
+      if (!fs) { setUpload(u => ({ ...u, err: "Filestack didn't load — the PDF won't be stored." })); return null; }
+      try {
+        const r = await fs.upload(file, { onProgress: e => setUpload(u => ({ ...u, pct: e.totalPercent || 0 })) },
+                                  { path: CFG.filestackBasePath + stmtId + "/statement.pdf", filename: "statement.pdf" });
+        const done = { url: r.url, handle: r.handle, name: file.name, size: r.size || file.size, mimetype: r.mimetype || "application/pdf" };
+        setUpload({ pct: 100, done, err: "" });
+        return done;
+      } catch (e) { setUpload(u => ({ ...u, err: "PDF upload failed: " + (e.message || e) })); return null; }
+    })();
+
+    try {
+      const res = await processStatementPdf(file, { onProgress: setProg, signal: ac.signal });
+      const lines = res.items.map((it, i) => ({
+        ...it, seq: i + 1, id: uid(),
+        cardholder: it.cardholder || res.meta.primaryName || "",
+        noReceipt: CFG.ocr.autoNoReceipt.some(re => re.test(it.desc)) || (it.amount !== null && it.amount < 0),
+        noReceiptReason: ""
+      }));
+      lines.forEach(l => { if (l.noReceipt) l.noReceiptReason = l.amount < 0 ? "Credit / payment" : "Fee or payment"; });
+      setItems(lines);
+      const cd = res.meta.closingDate || "";
+      setMeta({
+        title: (res.meta.cardName || "Statement") + (cd ? " — " + cd : "") + (res.meta.accountEnding ? " (…" + res.meta.accountEnding.slice(-5) + ")" : ""),
+        cardName: res.meta.cardName || "", accountEnding: res.meta.accountEnding || "",
+        closingDate: cd, primaryName: res.meta.primaryName || "", pageCount: res.pageCount, stmtId
+      });
+      setStep("review");
+    } catch (e) {
+      setErr(e.message || String(e)); setStep("pick");
+    }
+    await uploadP;
+  }
+
+  function cancel() { if (abortRef.current) abortRef.current.abort(); onCancel(); }
+
+  // --- review editing ---
+  const upd = (id, patch) => setItems(xs => xs.map(x => x.id === id ? { ...x, ...patch } : x));
+  const del = id => setItems(xs => xs.filter(x => x.id !== id));
+  const addRow = () => setItems(xs => [...xs, { id: uid(), seq: xs.length + 1, date: "", desc: "", amount: null, extra: [],
+                                                cardholder: meta.primaryName, page: null, noReceipt: false, manual: true }]);
+  const totals = useMemo(() => svc.stats(items), [items]);
+  const reviewCount = items.filter(x => x.needsReview || x.amount === null || !x.date || !x.desc).length;
+
+  async function save() {
+    if (!items.length) { setErr("There are no lines to save."); return; }
+    setStep("saving"); setErr("");
+    try {
+      const lines = items.map((x, i) => {
+        const { id, manual, ...rest } = x;
+        return { ...rest, seq: i + 1, amount: x.amount === "" ? null : x.amount, needsReview: !!x.needsReview && (x.amount === null || !x.desc) };
+      });
+      const { stmtId, ...m } = meta;
+      const sid = await svc.createStatement({ ...m, pdf: upload.done || null, filestackFolder: CFG.filestackBasePath + stmtId + "/" }, lines, session);
+      toast("Statement saved — " + lines.length + " lines.", "ok");
+      onDone(sid);
+    } catch (e) { setErr("Save failed: " + (e.message || e)); setStep("review"); }
+  }
+
+  if (step === "pick") return (
+    <div className="mx-auto max-w-xl">
+      <h2 className="text-xl font-semibold text-slate-900">New statement</h2>
+      <p className="mt-1 text-sm text-slate-500">
+        Choose the statement PDF. Each page is read right here in your browser, so a long scanned statement
+        can take a couple of minutes — leave the tab open.
+      </p>
+      <div onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); onPick(e.dataTransfer.files[0]); }}
+           onClick={() => fileInput.current.click()}
+           className="mt-4 cursor-pointer rounded-xl border-2 border-dashed border-slate-300 bg-white p-10 text-center hover:border-[#2a5f9e]">
+        <input ref={fileInput} type="file" accept="application/pdf,.pdf" className="hidden" onChange={e => onPick(e.target.files[0])} />
+        {file
+          ? <div><div className="font-medium text-slate-900">{file.name}</div><div className="text-xs text-slate-500">{fmtBytes(file.size)}</div></div>
+          : <div className="text-sm text-slate-500"><div className="text-3xl">📄</div>Drop the PDF here or click to choose</div>}
+      </div>
+      {err && <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{err}</p>}
+      <div className="mt-4 flex gap-2">
+        <button onClick={start} disabled={!file} className="rounded-lg bg-[#2a5f9e] px-4 py-2 text-sm font-medium text-white disabled:opacity-40">Read statement</button>
+        <button onClick={onCancel} className="rounded-lg border px-4 py-2 text-sm text-slate-700">Cancel</button>
+      </div>
+    </div>
+  );
+
+  if (step === "working") return (
+    <div className="mx-auto max-w-xl rounded-xl border bg-white p-6">
+      <h2 className="text-lg font-semibold text-slate-900">Reading {file.name}</h2>
+      <div className="mt-4 text-sm font-medium text-slate-800">{prog.stage}</div>
+      <div className="text-xs text-slate-500">{prog.detail}</div>
+      <div className="mt-2 h-2.5 w-full overflow-hidden rounded-full bg-slate-200">
+        <div className="progress-bar h-full bg-[#2a5f9e]" style={{ width: prog.pct + "%" }} />
+      </div>
+      <div className="mt-4 text-sm font-medium text-slate-800">Storing the original PDF</div>
+      <div className="text-xs text-slate-500">{upload.err || (upload.done ? "Uploaded" : upload.pct + "%")}</div>
+      <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-200">
+        <div className="progress-bar h-full bg-emerald-500" style={{ width: upload.pct + "%" }} />
+      </div>
+      <button onClick={cancel} className="mt-6 rounded-lg border px-4 py-2 text-sm text-slate-700">Cancel</button>
+    </div>
+  );
+
+  // review | saving
+  return (
+    <div>
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-xl font-semibold text-slate-900">Review the lines</h2>
+          <p className="text-sm text-slate-500">
+            {items.length} lines found across {meta.pageCount} pages · total {money(totals.total)}.
+            {reviewCount > 0 && <span className="ml-1 font-medium text-amber-700">{reviewCount} need a look (highlighted).</span>}
+            {" "}Compare each row with the strip of the statement next to it, fix anything the OCR got wrong, then save.
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={onCancel} className="rounded-lg border px-4 py-2 text-sm text-slate-700">Discard</button>
+          <button onClick={save} disabled={step === "saving"} className="rounded-lg bg-[#2a5f9e] px-4 py-2 text-sm font-medium text-white disabled:opacity-50">
+            {step === "saving" ? "Saving…" : "Save statement"}
+          </button>
+        </div>
+      </div>
+      {err && <p className="mb-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{err}</p>}
+      {upload.err && <p className="mb-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800">{upload.err} The lines will still be saved.</p>}
+
+      <div className="mb-4 grid gap-3 rounded-xl border bg-white p-4 md:grid-cols-4">
+        {[["title", "Title"], ["cardName", "Card"], ["accountEnding", "Account ending"], ["closingDate", "Closing date"]].map(([k, label]) => (
+          <label key={k} className="block text-xs text-slate-600">{label}
+            <input value={meta[k] || ""} onChange={e => setMeta(m => ({ ...m, [k]: e.target.value }))}
+                   className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm text-slate-900" />
+          </label>
+        ))}
+      </div>
+
+      <div className="overflow-x-auto rounded-xl border bg-white">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-left text-[11px] uppercase tracking-wider text-slate-500">
+            <tr><th className="px-3 py-2">#</th><th className="px-3 py-2">Date</th><th className="px-3 py-2">Description</th>
+                <th className="px-3 py-2">Cardholder</th><th className="px-3 py-2 text-right">Amount</th>
+                <th className="px-3 py-2">On statement</th><th className="px-3 py-2">Receipt</th><th></th></tr>
+          </thead>
+          <tbody>
+            {items.map((it, i) => {
+              const bad = it.needsReview || it.amount === null || !it.date || !it.desc;
+              return (
+                <tr key={it.id} className={"border-t align-top " + (bad ? "row-review" : "")}>
+                  <td className="px-3 py-2 text-slate-400">{i + 1}</td>
+                  <td className="px-3 py-2"><input value={it.date} onChange={e => upd(it.id, { date: e.target.value })} className="w-24 rounded border border-slate-300 px-2 py-1" /></td>
+                  <td className="px-3 py-2">
+                    <input value={it.desc} onChange={e => upd(it.id, { desc: e.target.value })} className="w-full min-w-[220px] rounded border border-slate-300 px-2 py-1" />
+                    {it.extra && it.extra.length > 0 && <div className="mt-0.5 text-[11px] text-slate-400">{it.extra.join(" · ")}</div>}
+                  </td>
+                  <td className="px-3 py-2"><input value={it.cardholder || ""} onChange={e => upd(it.id, { cardholder: e.target.value })} className="w-32 rounded border border-slate-300 px-2 py-1" /></td>
+                  <td className="px-3 py-2 text-right">
+                    <input type="number" step="0.01" value={it.amount === null ? "" : it.amount}
+                           onChange={e => upd(it.id, { amount: e.target.value === "" ? null : parseFloat(e.target.value), needsReview: false })}
+                           className="w-28 rounded border border-slate-300 px-2 py-1 text-right" />
+                  </td>
+                  <td className="px-3 py-2">{it.snip ? <img src={it.snip} className="snip max-w-[340px]" alt="" /> : <span className="text-xs text-slate-400">manual</span>}</td>
+                  <td className="px-3 py-2">
+                    <label className="flex items-center gap-1 whitespace-nowrap text-xs text-slate-600">
+                      <input type="checkbox" checked={!!it.noReceipt} onChange={e => upd(it.id, { noReceipt: e.target.checked })} /> not needed
+                    </label>
+                  </td>
+                  <td className="px-2 py-2"><button onClick={() => del(it.id)} className="text-xs text-red-500 hover:underline">remove</button></td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        <div className="border-t p-3"><button onClick={addRow} className="text-sm text-[#2a5f9e] hover:underline">+ Add a line the OCR missed</button></div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   9. STATEMENT VIEW — attach, note, flag, hover to preview
+   ============================================================ */
+function HoverCard({ hover }) {
+  if (!hover) return null;
+  const { line, x, y } = hover;
+  const atts = line.attachments || [];
+  const W = 420;
+  const left = Math.min(x + 16, window.innerWidth - W - 12);
+  const top = Math.min(y + 16, window.innerHeight - 320);
+  return (
+    <div className="hovercard fixed z-40 rounded-xl border bg-white p-3 shadow-xl" style={{ left, top, width: W }}>
+      {line.snip && <img src={line.snip} className="snip mb-2 w-full" alt="" />}
+      <div className="mb-2 flex items-center justify-between text-xs">
+        <span className="font-medium text-slate-800">{line.desc}</span>
+        <span className="font-semibold">{money(line.amount)}</span>
+      </div>
+      {line.note && <div className="mb-2 rounded bg-amber-50 px-2 py-1 text-xs text-amber-900">📝 {line.note}</div>}
+      {line.noReceipt && <div className="text-xs text-slate-500">No receipt needed{line.noReceiptReason ? " — " + line.noReceiptReason : ""}.</div>}
+      {!line.noReceipt && !atts.length && <div className="text-xs text-amber-700">No receipt attached yet — click the row to attach one.</div>}
+      {atts.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {atts.map((a, i) => <AttachmentThumb key={i} att={a} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatementView({ statement, session, fs, onBack, toast }) {
+  const [lines, setLines] = useState(null);
+  const [filter, setFilter] = useState("all");
+  const [q, setQ] = useState("");
+  const [holder, setHolder] = useState("");
+  const [hover, setHover] = useState(null);
+  const [openId, setOpenId] = useState(null);
+  const [busyId, setBusyId] = useState(null);
+  const [noteDraft, setNoteDraft] = useState({});
+  const [adding, setAdding] = useState(false);
+  const [newLine, setNewLine] = useState({ date: "", desc: "", amount: "" });
+
+  useEffect(() => {
+    const un = svc.subscribeLines(statement.id, setLines, e => toast("Couldn't load lines: " + e.message, "err"));
+    return un;
+  }, [statement.id]);
+
+  const holders = useMemo(() => [...new Set((lines || []).map(l => l.cardholder).filter(Boolean))].sort(), [lines]);
+  const stats = useMemo(() => svc.stats(lines || []), [lines]);
+  const shown = useMemo(() => {
+    const t = q.trim().toLowerCase();
+    return (lines || []).filter(l => {
+      const st = lineStatus(l);
+      if (filter !== "all" && st !== filter) return false;
+      if (holder && l.cardholder !== holder) return false;
+      if (t && !((l.desc || "") + " " + (l.extra || []).join(" ") + " " + (l.note || "") + " " + String(l.amount) + " " + (l.date || "")).toLowerCase().includes(t)) return false;
+      return true;
+    });
+  }, [lines, filter, q, holder]);
+
+  function attach(line) {
+    if (!fs) { toast("Upload isn't available — the Filestack script didn't load.", "err"); return; }
+    setBusyId(line.id);
+    fs.picker({
+      accept: ["application/pdf", "image/*", ".heic", ".doc", ".docx", ".xls", ".xlsx", ".eml", ".msg"],
+      maxFiles: 10,
+      fromSources: ["local_file_system", "googledrive", "dropbox", "onedrive", "url"],
+      storeTo: { path: (statement.filestackFolder || (CFG.filestackBasePath + statement.id + "/")) + line.id + "/" },
+      onUploadDone: async r => {
+        setBusyId(null);
+        const files = (r.filesUploaded || []).map(f => ({
+          url: f.url, handle: f.handle, name: f.filename, size: f.size, mimetype: f.mimetype,
+          uploadedBy: session.name, uploadedAt: Date.now()
+        }));
+        if (!files.length) return;
+        try {
+          await svc.updateLine(statement.id, line.id, { attachments: [...(line.attachments || []), ...files] }, session, lines);
+          toast(files.length + (files.length > 1 ? " files attached" : " file attached") + " to " + line.desc, "ok");
+        } catch (e) { toast("Couldn't save the attachment: " + e.message, "err"); }
+      },
+      onFileUploadFailed: (f, e) => { setBusyId(null); toast("Upload failed: " + ((e && e.message) || "unknown error"), "err"); },
+      onClose: () => setBusyId(null)
+    }).open();
+  }
+
+  async function removeAttachment(line, idx) {
+    if (!confirm("Remove this attachment from the line? (The file stays in Filestack.)")) return;
+    const atts = (line.attachments || []).filter((_, i) => i !== idx);
+    try { await svc.updateLine(statement.id, line.id, { attachments: atts }, session, lines); } catch (e) { toast(e.message, "err"); }
+  }
+  async function toggleNoReceipt(line) {
+    const v = !line.noReceipt;
+    let reason = line.noReceiptReason || "";
+    if (v) { reason = prompt("Why is no receipt needed? (optional)", reason || "") ; if (reason === null) return; }
+    try { await svc.updateLine(statement.id, line.id, { noReceipt: v, noReceiptReason: v ? reason : "" }, session, lines); } catch (e) { toast(e.message, "err"); }
+  }
+  async function saveNote(line) {
+    const v = noteDraft[line.id];
+    if (v === undefined || v === (line.note || "")) return;
+    try { await svc.updateLine(statement.id, line.id, { note: v }, session, lines); toast("Note saved", "ok"); } catch (e) { toast(e.message, "err"); }
+  }
+  async function deleteLine(line) {
+    if (!confirm("Delete this line from the statement?")) return;
+    try { await svc.deleteLine(statement.id, line.id, lines); } catch (e) { toast(e.message, "err"); }
+  }
+  async function addManual() {
+    if (!newLine.desc) return;
+    try {
+      await svc.addLine(statement.id, { seq: (lines ? lines.length : 0) + 1, date: newLine.date, desc: newLine.desc,
+        amount: newLine.amount === "" ? null : parseFloat(newLine.amount), extra: [], cardholder: holder || statement.primaryName || "", page: null, manual: true }, session, lines);
+      setNewLine({ date: "", desc: "", amount: "" }); setAdding(false);
+    } catch (e) { toast(e.message, "err"); }
+  }
+
+  function exportCsv() {
+    const rows = [["#", "Date", "Description", "Details", "Cardholder", "Amount", "Status", "Note", "No-receipt reason", "Attachments", "Attachment URLs"]];
+    (lines || []).forEach((l, i) => rows.push([i + 1, l.date, l.desc, (l.extra || []).join(" | "), l.cardholder, l.amount,
+      { done: "Attached", skip: "No receipt needed", todo: "Missing" }[lineStatus(l)], l.note, l.noReceiptReason,
+      (l.attachments || []).map(a => a.name).join(" | "), (l.attachments || []).map(a => a.url).join(" | ")]));
+    const csv = rows.map(r => r.map(csvEscape).join(",")).join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    a.download = (statement.title || "statement").replace(/[^\w\-]+/g, "_") + ".csv";
+    a.click();
+  }
+
+  const open = stats.todo;
+  return (
+    <div onMouseLeave={() => setHover(null)}>
+      <HoverCard hover={hover} />
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <button onClick={onBack} className="text-sm text-[#2a5f9e] hover:underline">← All statements</button>
+          <h2 className="text-xl font-semibold text-slate-900">{statement.title}</h2>
+          <div className="text-xs text-slate-500">
+            {statement.cardName}{statement.accountEnding ? " · ending " + statement.accountEnding : ""}
+            {statement.closingDate ? " · closes " + statement.closingDate : ""}
+            {statement.pdf && <a href={statement.pdf.url} target="_blank" rel="noopener" className="ml-2 text-[#2a5f9e] hover:underline">Open original PDF ↗</a>}
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={exportCsv} className="rounded-lg border bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50">Export CSV</button>
+        </div>
+      </div>
+
+      <div className="mb-3 rounded-xl border bg-white p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+          <div>
+            <span className="text-2xl font-semibold text-slate-900">{open === 0 ? "All done" : open + " to go"}</span>
+            <span className="ml-3 text-slate-500">{stats.done} attached · {stats.skip} no receipt needed · {(lines || []).length} lines · {money(stats.total)}</span>
+          </div>
+          <div className="text-xs text-slate-400">Hover a line to preview its receipts · click to attach or edit</div>
+        </div>
+        <div className="mt-2"><Progress done={stats.done} skip={stats.skip} total={(lines || []).length} /></div>
+      </div>
+
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        {[["all", "All"], ["todo", "Needs receipt"], ["done", "Attached"], ["skip", "No receipt needed"]].map(([k, label]) => (
+          <button key={k} onClick={() => setFilter(k)}
+                  className={"rounded-full border px-3 py-1 text-xs font-medium " + (filter === k ? "border-[#2a5f9e] bg-[#eaf1fb] text-[#2a5f9e]" : "bg-white text-slate-600")}>
+            {label} <span className="text-slate-400">{k === "all" ? (lines || []).length : stats[k]}</span>
+          </button>
+        ))}
+        {holders.length > 1 && (
+          <select value={holder} onChange={e => setHolder(e.target.value)} className="rounded-full border bg-white px-3 py-1 text-xs">
+            <option value="">All cardholders</option>
+            {holders.map(h => <option key={h} value={h}>{h}</option>)}
+          </select>
+        )}
+        <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search merchant, amount, note…"
+               className="ml-auto w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm sm:w-64" />
+      </div>
+
+      <div className="overflow-x-auto rounded-xl border bg-white">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-left text-[11px] uppercase tracking-wider text-slate-500">
+            <tr><th className="px-3 py-2">Date</th><th className="px-3 py-2">Description</th>
+                {holders.length > 1 && <th className="px-3 py-2">Cardholder</th>}
+                <th className="px-3 py-2 text-right">Amount</th><th className="px-3 py-2">Status</th><th className="px-3 py-2">Receipts</th><th className="px-3 py-2"></th></tr>
+          </thead>
+          <tbody>
+            {lines === null && <tr><td colSpan="7" className="p-6 text-center text-slate-500"><Spinner /> Loading lines…</td></tr>}
+            {lines !== null && !shown.length && <tr><td colSpan="7" className="p-6 text-center text-slate-500">Nothing matches.</td></tr>}
+            {shown.map(l => {
+              const st = lineStatus(l), isOpen = openId === l.id, atts = l.attachments || [];
+              return (
+                <React.Fragment key={l.id}>
+                  <tr className={"cursor-pointer border-t " + (st === "done" ? "row-done" : st === "skip" ? "row-skip" : "") + (isOpen ? " !bg-[#eaf1fb]" : "")}
+                      onMouseEnter={e => !isOpen && setHover({ line: l, x: e.clientX, y: e.clientY })}
+                      onMouseMove={e => !isOpen && setHover(h => h && h.line.id === l.id ? { line: l, x: e.clientX, y: e.clientY } : h)}
+                      onMouseLeave={() => setHover(null)}
+                      onClick={() => { setOpenId(isOpen ? null : l.id); setHover(null); }}>
+                    <td className="whitespace-nowrap px-3 py-2 text-slate-600">{l.date}</td>
+                    <td className="px-3 py-2">
+                      <div className="font-medium text-slate-900">{l.desc}</div>
+                      {l.extra && l.extra.length > 0 && <div className="text-[11px] text-slate-400">{l.extra.join(" · ")}</div>}
+                      {l.note && <div className="text-[11px] text-amber-800">📝 {l.note}</div>}
+                    </td>
+                    {holders.length > 1 && <td className="px-3 py-2 text-xs text-slate-600">{l.cardholder}</td>}
+                    <td className="whitespace-nowrap px-3 py-2 text-right font-medium">{money(l.amount)}</td>
+                    <td className="px-3 py-2"><Chip status={st} /></td>
+                    <td className="px-3 py-2">
+                      {atts.length > 0 && (
+                        <div className="flex gap-1">
+                          {atts.slice(0, 3).map((a, i) => <img key={i} src={thumbUrl(a, 80)} className="h-8 w-8 rounded border object-cover" alt="" onError={e => { e.target.style.display = "none"; }} />)}
+                          {atts.length > 3 && <span className="text-xs text-slate-500">+{atts.length - 3}</span>}
+                        </div>
+                      )}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2 text-right">
+                      <button onClick={e => { e.stopPropagation(); attach(l); }} disabled={busyId === l.id}
+                              className={"rounded-lg px-3 py-1 text-xs font-medium " + (st === "todo" ? "bg-[#2a5f9e] text-white hover:bg-[#234f84]" : "border bg-white text-slate-700 hover:bg-slate-50")}>
+                        {busyId === l.id ? "…" : atts.length ? "+ Add" : "Attach"}
+                      </button>
+                    </td>
+                  </tr>
+                  {isOpen && (
+                    <tr className="border-t bg-[#f7faff]">
+                      <td colSpan="7" className="px-4 py-3">
+                        <div className="grid gap-4 lg:grid-cols-[1fr_320px]">
+                          <div>
+                            {l.snip && <img src={l.snip} className="snip mb-3 w-full max-w-3xl" alt="" />}
+                            <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">Receipts ({atts.length})</div>
+                            {!atts.length && <div className="text-sm text-slate-500">None yet.</div>}
+                            <div className="flex flex-wrap gap-3">
+                              {atts.map((a, i) => (
+                                <div key={i} className="relative">
+                                  <AttachmentThumb att={a} size="lg" />
+                                  <div className="text-[10px] text-slate-400">{fmtBytes(a.size)}{a.uploadedBy ? " · " + a.uploadedBy : ""}</div>
+                                  <button onClick={e => { e.stopPropagation(); removeAttachment(l, i); }}
+                                          className="absolute -right-1 -top-1 h-5 w-5 rounded-full bg-white text-xs text-red-500 shadow hover:bg-red-50" title="Remove">✕</button>
+                                </div>
+                              ))}
+                            </div>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              <button onClick={e => { e.stopPropagation(); attach(l); }} className="rounded-lg bg-[#2a5f9e] px-3 py-1.5 text-xs font-medium text-white">Attach receipt{atts.length ? "s" : ""}</button>
+                              <button onClick={e => { e.stopPropagation(); toggleNoReceipt(l); }} className="rounded-lg border bg-white px-3 py-1.5 text-xs text-slate-700">
+                                {l.noReceipt ? "Receipt is needed after all" : "No receipt needed"}
+                              </button>
+                              {statement.pdf && l.page && <a href={statement.pdf.url + "#page=" + l.page} target="_blank" rel="noopener" onClick={e => e.stopPropagation()}
+                                  className="rounded-lg border bg-white px-3 py-1.5 text-xs text-slate-700">Statement page {l.page} ↗</a>}
+                              {isManager(session) && <button onClick={e => { e.stopPropagation(); deleteLine(l); }} className="ml-auto text-xs text-red-500 hover:underline">Delete line</button>}
+                            </div>
+                          </div>
+                          <div onClick={e => e.stopPropagation()}>
+                            <div className="mb-1 text-xs font-semibold uppercase tracking-wider text-slate-500">Note</div>
+                            <textarea value={noteDraft[l.id] !== undefined ? noteDraft[l.id] : (l.note || "")}
+                                      onChange={e => setNoteDraft(d => ({ ...d, [l.id]: e.target.value }))}
+                                      onBlur={() => saveNote(l)} rows="3" placeholder="Store #, purpose, who it was for…"
+                                      className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm" />
+                            {l.noReceipt && <div className="mt-2 text-xs text-slate-500">No receipt needed{l.noReceiptReason ? ": " + l.noReceiptReason : ""}</div>}
+                            {l.updatedBy && <div className="mt-2 text-[11px] text-slate-400">Last updated by {l.updatedBy.name} · {fmtDate(l.updatedAt)}</div>}
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+        <div className="border-t p-3">
+          {!adding
+            ? <button onClick={() => setAdding(true)} className="text-sm text-[#2a5f9e] hover:underline">+ Add a line that's missing</button>
+            : <div className="flex flex-wrap items-center gap-2">
+                <input value={newLine.date} onChange={e => setNewLine(n => ({ ...n, date: e.target.value }))} placeholder="MM/DD/YY" className="w-24 rounded border px-2 py-1 text-sm" />
+                <input value={newLine.desc} onChange={e => setNewLine(n => ({ ...n, desc: e.target.value }))} placeholder="Description" className="w-64 rounded border px-2 py-1 text-sm" />
+                <input type="number" step="0.01" value={newLine.amount} onChange={e => setNewLine(n => ({ ...n, amount: e.target.value }))} placeholder="Amount" className="w-28 rounded border px-2 py-1 text-sm" />
+                <button onClick={addManual} className="rounded-lg bg-[#2a5f9e] px-3 py-1 text-xs font-medium text-white">Add</button>
+                <button onClick={() => setAdding(false)} className="text-xs text-slate-500">Cancel</button>
+              </div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   10. APP SHELL
+   ============================================================ */
+function App() {
+  const fbReady = useFirebaseReady();
+  const fs = useFilestack();
+  const [toast, showToast] = useToast();
+  const [dir, setDir] = useState(null);
+  const [dirError, setDirError] = useState("");
+  const [session, setSession] = useState(null);
+  const [view, setView] = useState({ name: "list" });
+  const [statements, setStatements] = useState([]);
+  const [loadingStmts, setLoadingStmts] = useState(true);
+
+  // Directory load, then restore a saved session against the LIVE directory.
+  useEffect(() => {
+    directoryService.load().then(d => {
+      setDir(d);
+      try {
+        const saved = JSON.parse(localStorage.getItem("cc_session") || "null");
+        if (saved) {
+          const s = resolveSession(saved.email, saved.pw, d);
+          if (!s.error) setSession(s); else localStorage.removeItem("cc_session");
+        }
+      } catch (e) {}
+    }).catch(e => setDirError("Couldn't load the directory: " + e.message));
+  }, []);
+
+  useEffect(() => {
+    if (!fbReady || !session) return;
+    setLoadingStmts(true);
+    const un = svc.subscribeStatements(xs => { setStatements(xs); setLoadingStmts(false); },
+                                       e => { setLoadingStmts(false); showToast("Firestore: " + e.message, "err"); });
+    return un;
+  }, [fbReady, session]);
+
+  function signIn(sess, creds) {
+    setSession(sess);
+    try { localStorage.setItem("cc_session", JSON.stringify(creds)); } catch (e) {}
+  }
+  function signOut() {
+    setSession(null); setView({ name: "list" });
+    try { localStorage.removeItem("cc_session"); } catch (e) {}
+  }
+  async function deleteStatement(s) {
+    if (!confirm("Delete “" + s.title + "” and all its lines? Receipts already uploaded stay in Filestack.")) return;
+    try { await svc.deleteStatement(s.id); showToast("Statement deleted", "ok"); } catch (e) { showToast(e.message, "err"); }
+  }
+
+  if (!session) return <div><Login dir={dir} dirError={dirError} onSignIn={signIn} /><Toast toast={toast} /></div>;
+
+  const current = view.name === "statement" ? statements.find(s => s.id === view.id) : null;
+
+  return (
+    <div className="mx-auto max-w-7xl p-4">
+      <header className="mb-5 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-[#2a5f9e] text-lg text-white">🧾</div>
+          <div>
+            <div className="text-[10px] font-bold uppercase tracking-widest text-[#8c909a]">DPM</div>
+            <div className="-mt-0.5 font-semibold text-slate-900">ReceiptMi</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-3 text-sm">
+          <span className="text-slate-600"><b>{session.name}</b> <span className="text-slate-400">· {roleLabel(session.role)}</span></span>
+          <button onClick={signOut} className="rounded-lg border bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50">Sign out</button>
+        </div>
+      </header>
+
+      {view.name === "list" && (
+        <StatementList statements={statements} loading={loadingStmts} session={session}
+                       onOpen={s => setView({ name: "statement", id: s.id })} onNew={() => setView({ name: "new" })} onDelete={deleteStatement} />
+      )}
+      {view.name === "new" && (
+        <NewStatement session={session} fs={fs} toast={showToast}
+                      onDone={id => setView({ name: "statement", id })} onCancel={() => setView({ name: "list" })} />
+      )}
+      {view.name === "statement" && (current
+        ? <StatementView statement={current} session={session} fs={fs} toast={showToast} onBack={() => setView({ name: "list" })} />
+        : <div className="rounded-xl border bg-white p-8 text-center text-sm text-slate-500">{loadingStmts ? <Spinner /> : "That statement is no longer available."}</div>)}
+
+      <footer className="mt-8 text-center text-[11px] text-slate-400">ReceiptMi v{CFG.version} · OCR runs in your browser · files stored in Filestack · data in Firestore</footer>
+      <Toast toast={toast} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
