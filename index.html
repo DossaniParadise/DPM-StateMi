@@ -3,34 +3,42 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>DPM ReceiptMi — Card Statement Receipts</title>
-<meta name="apple-mobile-web-app-title" content="ReceiptMi" />
+<title>DPM StateMi — Statement Visualizer</title>
+<meta name="apple-mobile-web-app-title" content="StateMi" />
 
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://static.filestackapi.com/filestack-js/3.x.x/filestack.min.js"></script>
-<!-- pdf.js renders statement pages to a canvas; Tesseract.js reads them. Both run
-     entirely in the browser — the statement never leaves the user's machine
-     except for the Filestack upload of the original PDF. -->
+<!-- pdf.js turns the statement PDF into page images in the browser. Tesseract
+     is only used, lazily, to read the ONE row a user clicks so the list and the
+     CSV get a label — the page itself is never OCR'd. -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js" defer></script>
 
 <style>
   body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  .snip { image-rendering: auto; border: 1px solid #e2e8f0; border-radius: 6px; background: #fff; }
-  .row-done   { background: #f0fdf4; }
-  .row-skip   { background: #f8fafc; color: #64748b; }
-  .row-review { background: #fffbeb; }
-  .hovercard  { pointer-events: none; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .spin { animation: spin 1s linear infinite; }
   .thumb { width: 96px; height: 96px; object-fit: cover; border-radius: 8px; border: 1px solid #e2e8f0; background: #f8fafc; }
   .thumb-lg { width: 128px; height: 128px; }
   input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; }
   .progress-bar { transition: width .3s ease; }
+  .hovercard { pointer-events: none; }
   @media (hover: none) { .hovercard { display: none; } }
+
+  /* Statement page + overlay bands */
+  .page { position: relative; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.12); user-select: none; }
+  .page img { display: block; width: 100%; height: auto; }
+  .band { position: absolute; left: 0; right: 0; cursor: pointer; border-left: 4px solid transparent; transition: background .12s; }
+  .band-todo { background: rgba(245,158,11,.16); border-left-color: #f59e0b; }
+  .band-done { background: rgba(16,185,129,.16); border-left-color: #10b981; }
+  .band-skip { background: rgba(100,116,139,.14); border-left-color: #94a3b8; }
+  .band:hover, .band-active { filter: brightness(.93); outline: 2px solid rgba(42,95,158,.6); outline-offset: -2px; }
+  .band-ghost { position: absolute; left: 0; right: 0; pointer-events: none; background: rgba(42,95,158,.14); outline: 2px dashed rgba(42,95,158,.7); outline-offset: -2px; }
+  .badge { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 999px; color: #fff; pointer-events: none; white-space: nowrap; }
+  .badge-todo { background: #d97706; } .badge-done { background: #059669; } .badge-skip { background: #64748b; }
 </style>
 </head>
 <body class="bg-slate-100">
@@ -42,9 +50,9 @@
      ============================================================ -->
 <script>
 window.APP_CONFIG = {
-  version: "1.0",
+  version: "2.0",
 
-  // Firestore — same project as PayMi. This app only touches the
+  // Firestore — same project as PayMi. StateMi only touches the
   // `cc_statements` collection (and its `lines` sub-collection).
   firebase: {
     apiKey: "AIzaSyAxW6wajL9PH1Wlw3_QuBXgAMFgYWjkJp8",
@@ -58,8 +66,9 @@ window.APP_CONFIG = {
 
   // Filestack — public key, same as PayMi. Lock it down with domain/referrer
   // restrictions in the Filestack dashboard. Files are stored under
-  //   /statements/<statement id>/statement.pdf          (the original)
-  //   /statements/<statement id>/<line id>/<file>       (receipts)
+  //   /statements/<id>/statement.pdf          the original
+  //   /statements/<id>/pages/page-01.jpg      one image per page (what the viewer shows)
+  //   /statements/<id>/<line id>/<file>       receipts / supporting documents
   filestackApiKey: "Afe1LdETdKFIBOgrA4TgLz",
   filestackBasePath: "/statements/",
 
@@ -86,21 +95,25 @@ window.APP_CONFIG = {
     { email: "tony@dossaniparadise.com",     name: "Tony Varghese" }
   ],
 
-  // Who may upload/delete statements. Everyone who can sign in may attach
-  // receipts, add notes and mark lines "no receipt needed".
+  // Who may upload/delete statements. Everyone who can sign in may mark
+  // lines, attach documents, add notes and flag "no receipt needed".
   managerRoles: ["ADMIN", "FINANCE", "VP"],
 
-  // --- OCR -------------------------------------------------------------------
-  ocr: {
-    renderScale: 2.6,          // pdf.js scale (~190dpi). Higher = slower, more accurate.
-    snipWidth: 1100,           // px width of the per-line image crop saved with each line
-    snipQuality: 0.72,
-    // Lines matching these are auto-marked "no receipt needed" at import.
-    autoNoReceipt: [
-      /payment\s*-?\s*thank you/i, /mobile payment/i, /autopay/i,
-      /membership fee/i, /annual fee/i, /interest charge/i, /late fee/i
-    ]
-  }
+  // --- Pages & rows ----------------------------------------------------------
+  pages: {
+    width: 1600,            // px width of the stored page images (legible when zoomed, ~300 KB each)
+    quality: 0.82,          // JPEG quality
+    // Row detection: a horizontal rule is a pixel row where at least this
+    // share of the page width (between the margins) is dark.
+    ruleMinCoverage: 0.5,
+    ruleDarkness: 150,      // 0-255 luminance threshold for "dark"
+    defaultBandHeight: 0.024,  // page-height fraction used where no rules are found (summary pages)
+    maxBandHeight: 0.09        // taller gaps between rules are not a single row
+  },
+
+  // Read the clicked strip with Tesseract to pre-fill a label + amount.
+  // Purely a convenience — turn off to skip the ~4 MB language download.
+  labelOcr: true
 };
 </script>
 
@@ -109,206 +122,19 @@ import { initializeApp }
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import {
   initializeFirestore, collection, doc, addDoc, updateDoc, deleteDoc, setDoc, getDocs,
-  writeBatch, onSnapshot, query, orderBy, serverTimestamp, arrayUnion
+  writeBatch, onSnapshot, query, orderBy, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
 const app = initializeApp(window.APP_CONFIG.firebase);
 const db  = initializeFirestore(app, { experimentalAutoDetectLongPolling: true });
 window.FS = { db, collection, doc, addDoc, updateDoc, deleteDoc, setDoc, getDocs,
-              writeBatch, onSnapshot, query, orderBy, serverTimestamp, arrayUnion };
+              writeBatch, onSnapshot, query, orderBy, serverTimestamp };
 window.dispatchEvent(new Event("firebase-ready"));
-</script>
-
-<script>
-/* ------------------------------------------------------------------
-   STATEMENT PARSER — pure functions, shared by the Node test and the app.
-   Input: OCR words with bounding boxes for ONE page.
-     word = { text, x0, y0, x1, y1, conf }
-   Output: { rows, items, meta }
-     rows  = [{ y, text, words }]              every visual text row
-     items = [{ date, desc, amount, page, y0, y1 }]  parsed charge lines
-   ------------------------------------------------------------------ */
-(function (root) {
-
-  // Group words into visual rows by vertical centre. Two words belong to the
-  // same row when their centres differ by less than ~60% of the median word
-  // height on the page. Words are then sorted left-to-right.
-  function wordsToRows(words) {
-    const ws = words.filter(w => w.text && w.text.trim());
-    if (!ws.length) return [];
-    const hs = ws.map(w => w.y1 - w.y0).sort((a, b) => a - b);
-    const medH = hs[Math.floor(hs.length / 2)] || 10;
-    const tol = Math.max(4, medH * 0.6);
-    const sorted = ws.slice().sort((a, b) => ((a.y0 + a.y1) - (b.y0 + b.y1)));
-    const rows = [];
-    sorted.forEach(w => {
-      const cy = (w.y0 + w.y1) / 2;
-      const r = rows[rows.length - 1];
-      if (r && Math.abs(cy - r.cy) <= tol) {
-        r.words.push(w);
-        r.cy = (r.cy * (r.words.length - 1) + cy) / r.words.length;
-      } else rows.push({ cy, words: [w] });
-    });
-    return rows.map(r => {
-      r.words.sort((a, b) => a.x0 - b.x0);
-      return {
-        y: r.cy,
-        y0: Math.min(...r.words.map(w => w.y0)),
-        y1: Math.max(...r.words.map(w => w.y1)),
-        x0: Math.min(...r.words.map(w => w.x0)),
-        text: r.words.map(w => w.text).join(" ").replace(/\s+/g, " ").trim(),
-        words: r.words
-      };
-    });
-  }
-
-  // OCR confuses a few glyphs in dates and amounts; normalise before matching.
-  function fixDigits(s) {
-    return s.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1").replace(/S/g, "5").replace(/B/g, "8");
-  }
-
-  // Cosmetic OCR fixes for the description column.
-  function cleanDesc(d) {
-    return (d || "")
-      .replace(/^[\s|\-—–_.,:;'"`]+/, "")
-      .replace(/(^|\s)1?T?™X?(?=\s|$)/g, "$1TX").replace(/\s1X$/, " TX")
-      .replace(/Ap\|IPay|Ap[l1|]Pay/g, "AplPay")
-      .replace(/\s+/g, " ").trim()
-      .replace(/\b([A-Z]{3,})\.(?=\s|$)/g, "$1");   // OCR adds stray periods: "MAPS. EAST", "MSBILL.INFO."
-  }
-
-  const DATE_RE = /^(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{2,4})$/;
-  // "$1,234.56", "-$12.00", "$8.54 ¢" (the pay-over-time diamond OCRs as junk)
-  const AMT_RE = /^(-|—|–)?\$?\s?(\d{1,3}(?:[,.]\d{3})*|\d+)[.,](\d{2})(-)?$/;
-
-  function parseAmountToken(tok) {
-    let t = fixDigits(tok.replace(/[^\d$.,\-—–]/g, ""));
-    let m = t.match(AMT_RE);
-    if (!m && /\$/.test(tok)) {
-      // "$5.41¢4": the pay-over-time diamond OCRs as junk glued to the cents.
-      const g = t.match(/^(-|—|–)?\$\s?(\d{1,3}(?:,\d{3})*|\d+)\.(\d{2})/);
-      if (g) m = [g[0], g[1], g[2], g[3], undefined];
-    }
-    if (!m) return null;
-    const whole = m[2].replace(/[,.]/g, "");
-    const val = parseFloat(whole + "." + m[3]);
-    const neg = !!(m[1] || m[4]);
-    return neg ? -val : val;
-  }
-
-  function parseDateToken(tok) {
-    const t = fixDigits(tok);
-    const m = t.match(DATE_RE);
-    if (!m) return null;
-    const mm = +m[1], dd = +m[2];
-    if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return null;
-    let yy = m[3]; if (yy.length === 4) yy = yy.slice(2);
-    return `${String(mm).padStart(2, "0")}/${String(dd).padStart(2, "0")}/${yy}`;
-  }
-
-  // Lines we never want as items even though they start with a date.
-  const SKIP_RE = /closing date|statement|account ending|arrival date|departure date|^p\.\s*\d/i;
-
-  const END_RE = /continued on|^amount$|card ending|monthly spending limit|^total|^new charges|^payments|^credits|^fees|^interest|^detail/i;
-
-  function parsePage(words, pageNo, pageWidth, startCardholder) {
-    const rows = wordsToRows(words);
-    const items = [];
-    let meta = {};
-    let current = null;
-    let cardholder = startCardholder || "";
-    let recent = [];   // last few row texts, to find the name above "Card Ending"
-    const rightEdge = pageWidth || Math.max(...rows.map(r => Math.max(...r.words.map(w => w.x1))), 1000);
-
-    rows.forEach(row => {
-      const text = row.text;
-      // --- statement metadata ---
-      let m;
-      if ((m = text.match(/closing date\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/i))) meta.closingDate = parseDateToken(m[1]) || m[1];
-      if ((m = text.match(/account ending\s*([\d\-]{5,})/i))) meta.accountEnding = m[1];
-      if ((m = text.match(/p\.\s*(\d+)\s*\/\s*(\d+)/i))) meta.pageOf = [+m[1], +m[2]];
-      if (/business (platinum|gold|green)|platinum card|gold card/i.test(text) && !meta.cardName) meta.cardName = text.replace(/\s*p\.\s*\d+\s*\/\s*\d+.*$/i, "").trim();
-      if (!meta.primaryName && rows.indexOf(row) < 6) {
-        // Header: the primary cardholder's name sits beside the Amex logo, which
-        // OCRs as "American} ..." / "EXPRESS ~Al DOSSANI". Strip the logo junk.
-        const t = text.replace(/american\}?|express|~|[^A-Za-z\s'.\-]/gi, " ").replace(/\s+/g, " ").trim();
-        if (/^[A-Za-z][A-Za-z'.\-]+(\s+[A-Za-z][A-Za-z'.\-]+){1,2}$/.test(t) &&
-            !/MGT|INC|LLC|CARD|CORP|MANAGEMENT|PARADISE|GROUP|CLOSING|AMOUNT/i.test(t)) meta.primaryName = t.toUpperCase();
-      }
-
-      // Cardholder section header: "KARIM MAWANI" / "Card Ending 9-21049 Monthly Spending Limit: $5,000"
-      if ((m = text.match(/^(.*?)\s*card ending\s*([\d\-]{4,})/i))) {
-        const looksLikeName = t => /^[A-Za-z][A-Za-z'.\-]+(\s+[A-Za-z][A-Za-z'.\-]+)+$/.test(t) && !/amount|total|continued|card/i.test(t);
-        let name = (m[1] || "").trim();
-        if (!looksLikeName(name)) name = recent.slice().reverse().find(looksLikeName) || "";
-        if (name) {
-          cardholder = name;
-          // The name row was probably swallowed as a continuation of the item above.
-          items.forEach(it => { it.extra = it.extra.filter(x => x !== name); });
-        }
-        current = null; recent.push(text); recent = recent.slice(-4); return;
-      }
-      if (END_RE.test(text)) { current = null; recent.push(text); recent = recent.slice(-4); return; }
-      recent.push(text); recent = recent.slice(-4);
-      if (SKIP_RE.test(text) && !/^\d/.test(text)) return;
-
-      const ws = row.words;
-      const date = parseDateToken(ws[0].text);
-      // "08/16/26 08/20/26" (lodging arrival/departure) — every token is a date: continuation, not an item.
-      const allDates = ws.every(w => parseDateToken(w.text));
-      // Amount must be the LAST token and sit in the right ~30% of the page.
-      const last = ws[ws.length - 1];
-      let amount = null, amtIdx = -1;
-      for (let i = ws.length - 1; i >= Math.max(0, ws.length - 3); i--) {
-        const a = parseAmountToken(ws[i].text);
-        if (a !== null && ws[i].x0 > rightEdge * 0.68) { amount = a; amtIdx = i; break; }
-      }
-      // "-$12.00" sometimes OCRs as "- $12.00" or "$12.00 -": handle a lone
-      // minus token next to the amount.
-      if (amount !== null && amtIdx > 0 && /^[-—–]$/.test(ws[amtIdx - 1].text)) { amount = -Math.abs(amount); amtIdx--; }
-
-      if (date && amount !== null && amtIdx >= 1 && !allDates) {
-        const descWords = ws.slice(1, amtIdx);
-        const desc = cleanDesc(descWords.map(w => w.text).join(" "));
-        if (SKIP_RE.test(desc)) { current = null; return; }
-        current = { date, desc, amount, page: pageNo, y0: row.y0, y1: row.y1, extra: [], cardholder };
-        items.push(current);
-        return;
-      }
-      if (date && amount === null && !allDates) {
-        // A dated row with no amount (OCR dropped it) — still an item, flag it.
-        const desc = cleanDesc(ws.slice(1).map(w => w.text).join(" "));
-        if (desc && !SKIP_RE.test(desc)) {
-          current = { date, desc, amount: null, page: pageNo, y0: row.y0, y1: row.y1, extra: [], needsReview: true, cardholder };
-          items.push(current);
-        }
-        return;
-      }
-      // Continuation row (phone number, "MERCHANDISE", lodging dates...) —
-      // belongs to the item above it if it is close and indented past the date column.
-      if (current && (!date || allDates) && amount === null && row.x0 > rightEdge * 0.08 &&
-          row.y0 - current.y1 < (row.y1 - row.y0) * 4.5) {
-        if (text && !SKIP_RE.test(text)) current.extra.push(text);
-        current.y1 = Math.max(current.y1, row.y1);
-        return;
-      }
-      current = null;
-    });
-
-    items.forEach(it => { it.extra = it.extra.slice(0, 6).map(cleanDesc).filter(Boolean); });
-    return { rows, items, meta, cardholder };
-  }
-
-  const api = { wordsToRows, parsePage, parseAmountToken, parseDateToken };
-  if (typeof module !== "undefined" && module.exports) module.exports = api;
-  else root.StatementParser = api;
-})(typeof window !== "undefined" ? window : globalThis);
-
 </script>
 <script type="text/babel">
 const { useState, useEffect, useMemo, useRef, useCallback } = React;
 const CFG = window.APP_CONFIG;
-const Parser = window.StatementParser;
+const SESSION_KEY = "statemi_session";
 
 /* ============================================================
    0. HELPERS
@@ -352,6 +178,38 @@ function cleanForFirestore(obj) {
     return o;
   }
   return obj;
+}
+
+// Firestore's "Missing or insufficient permissions" means the security rules
+// don't cover this app's collection yet. Say so, with the fix.
+const RULES_SNIPPET =
+`match /${CFG.statementsCollection}/{statementId} {
+  allow read, write: if true;
+  match /lines/{lineId} {
+    allow read, write: if true;
+  }
+}`;
+function isPermissionError(e) { return /permission|insufficient/i.test((e && (e.code + " " + e.message)) || ""); }
+function explainError(e, what) {
+  if (isPermissionError(e)) return what + " failed: Firestore rejected it (Missing or insufficient permissions).\n" +
+    "The Firestore security rules don't allow the \"" + CFG.statementsCollection + "\" collection yet — see the yellow box at the top for the fix.";
+  return what + " failed: " + ((e && e.message) || e);
+}
+
+function PermissionBanner() {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="mb-4 rounded-xl border border-amber-400 bg-amber-50 p-4 text-sm text-amber-900">
+      <div className="font-semibold">Firestore is blocking this app (Missing or insufficient permissions)</div>
+      <p className="mt-1">Same project as PayMi, but the security rules only cover PayMi's collections. Add this block inside
+        <code className="mx-1 rounded bg-amber-100 px-1">match /databases/{"{database}"}/documents {"{ … }"}</code>
+        in Firebase console → Firestore Database → Rules, then Publish and reload this page:</p>
+      <pre className="mt-2 overflow-x-auto rounded-lg bg-white p-3 text-xs text-slate-800">{RULES_SNIPPET}</pre>
+      <button onClick={() => { navigator.clipboard && navigator.clipboard.writeText(RULES_SNIPPET).then(() => setCopied(true)); }}
+              className="mt-2 rounded-lg border border-amber-500 bg-white px-3 py-1 text-xs font-medium text-amber-900">{copied ? "Copied" : "Copy rules"}</button>
+      <span className="ml-2 text-xs">Use the same condition PayMi's <code>invoices</code> rule uses if it isn't <code>if true</code>.</span>
+    </div>
+  );
 }
 
 function csvEscape(v) {
@@ -457,177 +315,6 @@ function useFirebaseReady() {
 }
 
 /* ============================================================
-   3. OCR PIPELINE — pdf.js render → Tesseract → StatementParser
-   ============================================================ */
-async function processStatementPdf(file, { onProgress, signal }) {
-  if (!window.pdfjsLib) throw new Error("pdf.js didn't load. Check the network and reload.");
-  if (!window.Tesseract) throw new Error("Tesseract.js didn't load. Check the network and reload.");
-  window.pdfjsLib.GlobalWorkerOptions.workerSrc =
-    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-
-  const report = (stage, pct, detail) => onProgress && onProgress({ stage, pct, detail });
-  report("Loading PDF", 2, file.name);
-  const buf = await file.arrayBuffer();
-  const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
-  const pageCount = pdf.numPages;
-
-  report("Starting OCR engine", 4, "downloading language data on first use");
-  const worker = await window.Tesseract.createWorker("eng", 1, {
-    logger: m => {
-      if (m.status === "loading tesseract core" || m.status === "loading language traineddata")
-        report("Starting OCR engine", 4 + Math.round((m.progress || 0) * 4), m.status);
-    }
-  });
-  await worker.setParameters({ preserve_interword_spaces: "1" });
-
-  const items = [], metaAll = {};
-  let cardholder = "";
-  const t0 = Date.now();
-  try {
-    for (let p = 1; p <= pageCount; p++) {
-      if (signal && signal.aborted) throw new Error("Cancelled");
-      const elapsed = (Date.now() - t0) / 1000;
-      const eta = p > 1 ? Math.round(elapsed / (p - 1) * (pageCount - p + 1)) : null;
-      report("Reading page " + p + " of " + pageCount, 8 + Math.round((p - 1) / pageCount * 90),
-             eta !== null ? "about " + (eta < 60 ? eta + "s" : Math.ceil(eta / 60) + " min") + " left" : "");
-
-      const page = await pdf.getPage(p);
-      const viewport = page.getViewport({ scale: CFG.ocr.renderScale });
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.floor(viewport.width); canvas.height = Math.floor(viewport.height);
-      await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-
-      const { data } = await worker.recognize(canvas, {}, { blocks: true, text: false });
-      const words = [];
-      const walk = (blocks) => (blocks || []).forEach(b => (b.paragraphs || []).forEach(pg =>
-        (pg.lines || []).forEach(l => (l.words || []).forEach(w =>
-          words.push({ text: w.text, x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1, conf: w.confidence })))));
-      if (data.blocks) walk(data.blocks);
-      else if (data.words) data.words.forEach(w => words.push({ text: w.text, x0: w.bbox.x0, y0: w.bbox.y0, x1: w.bbox.x1, y1: w.bbox.y1, conf: w.confidence }));
-
-      const res = Parser.parsePage(words, p, canvas.width, cardholder);
-      cardholder = res.cardholder;
-      Object.keys(res.meta).forEach(k => { if (metaAll[k] === undefined) metaAll[k] = res.meta[k]; });
-
-      // Crop a strip of the page for every line so reviewers (and the hover
-      // card later) can see exactly what the statement printed.
-      res.items.forEach(it => {
-        const pad = Math.round((it.y1 - it.y0) * 0.12) + 3;
-        const sy = Math.max(0, it.y0 - pad), sh = Math.min(canvas.height - sy, it.y1 - it.y0 + pad * 2);
-        const sx = Math.round(canvas.width * 0.04), sw = Math.round(canvas.width * 0.92);
-        const w = Math.min(CFG.ocr.snipWidth, sw), h = Math.max(1, Math.round(sh * w / sw));
-        const c = document.createElement("canvas"); c.width = w; c.height = h;
-        c.getContext("2d").drawImage(canvas, sx, sy, sw, sh, 0, 0, w, h);
-        it.snip = c.toDataURL("image/jpeg", CFG.ocr.snipQuality);
-        delete it.y0; delete it.y1;
-        items.push(it);
-      });
-      page.cleanup();
-    }
-  } finally {
-    try { await worker.terminate(); } catch (e) {}
-  }
-  report("Done", 100, items.length + " lines found");
-  return { items, meta: metaAll, pageCount };
-}
-
-/* ============================================================
-   4. FIRESTORE SERVICE
-   ============================================================ */
-const svc = {
-  col() { return window.FS.collection(window.FS.db, CFG.statementsCollection); },
-  linesCol(sid) { return window.FS.collection(window.FS.db, CFG.statementsCollection, sid, "lines"); },
-
-  subscribeStatements(cb, onErr) {
-    const { query, orderBy, onSnapshot } = window.FS;
-    return onSnapshot(query(this.col(), orderBy("createdAt", "desc")),
-      snap => cb(snap.docs.map(d => ({ id: d.id, ...d.data() }))), onErr);
-  },
-  subscribeLines(sid, cb, onErr) {
-    const { query, orderBy, onSnapshot } = window.FS;
-    return onSnapshot(query(this.linesCol(sid), orderBy("seq", "asc")),
-      snap => cb(snap.docs.map(d => ({ id: d.id, ...d.data() }))), onErr);
-  },
-
-  async createStatement(meta, lines, session) {
-    const { doc, writeBatch, serverTimestamp } = window.FS;
-    const sref = doc(this.col());
-    const stats = this.stats(lines);
-    const batches = [];
-    let b = writeBatch(window.FS.db), n = 0;
-    b.set(sref, cleanForFirestore({
-      ...meta, lineCount: lines.length, doneCount: stats.done, skipCount: stats.skip,
-      total: stats.total, status: "ready",
-      createdBy: { id: session.id, name: session.name, email: session.email },
-      createdAt: serverTimestamp(), updatedAt: serverTimestamp()
-    }));
-    n++;
-    for (const l of lines) {
-      const lref = doc(this.linesCol(sref.id));
-      b.set(lref, cleanForFirestore({ ...l, attachments: l.attachments || [], note: l.note || "",
-        noReceipt: !!l.noReceipt, updatedAt: serverTimestamp() }));
-      if (++n >= 400) { batches.push(b.commit()); b = writeBatch(window.FS.db); n = 0; }
-    }
-    if (n) batches.push(b.commit());
-    await Promise.all(batches);
-    return sref.id;
-  },
-
-  stats(lines) {
-    const s = { done: 0, skip: 0, todo: 0, total: 0 };
-    lines.forEach(l => { s[lineStatus(l)]++; s.total += (+l.amount || 0); });
-    return s;
-  },
-
-  async updateLine(sid, lid, patch, session, allLines) {
-    const { doc, updateDoc, serverTimestamp } = window.FS;
-    await updateDoc(doc(this.linesCol(sid), lid), cleanForFirestore({
-      ...patch, updatedAt: serverTimestamp(), updatedBy: { id: session.id, name: session.name }
-    }));
-    // Keep the statement's summary counters in step so the list view is cheap.
-    if (allLines) {
-      const next = allLines.map(l => l.id === lid ? { ...l, ...patch } : l);
-      const s = this.stats(next);
-      try { await updateDoc(doc(this.col(), sid), { doneCount: s.done, skipCount: s.skip, lineCount: next.length, updatedAt: serverTimestamp() }); } catch (e) {}
-    }
-  },
-
-  async addLine(sid, line, session, allLines) {
-    const { doc, setDoc, serverTimestamp } = window.FS;
-    const lref = doc(this.linesCol(sid));
-    await setDoc(lref, cleanForFirestore({ ...line, attachments: [], note: "", noReceipt: false,
-      updatedAt: serverTimestamp(), updatedBy: { id: session.id, name: session.name } }));
-    const s = this.stats([...(allLines || []), line]);
-    try { await window.FS.updateDoc(doc(this.col(), sid), { lineCount: (allLines || []).length + 1, doneCount: s.done, skipCount: s.skip }); } catch (e) {}
-  },
-
-  async deleteLine(sid, lid, allLines) {
-    const { doc, deleteDoc, updateDoc } = window.FS;
-    await deleteDoc(doc(this.linesCol(sid), lid));
-    const next = (allLines || []).filter(l => l.id !== lid);
-    const s = this.stats(next);
-    try { await updateDoc(doc(this.col(), sid), { lineCount: next.length, doneCount: s.done, skipCount: s.skip }); } catch (e) {}
-  },
-
-  async updateStatement(sid, patch) {
-    const { doc, updateDoc, serverTimestamp } = window.FS;
-    await updateDoc(doc(this.col(), sid), cleanForFirestore({ ...patch, updatedAt: serverTimestamp() }));
-  },
-
-  async deleteStatement(sid) {
-    const { getDocs, writeBatch, doc } = window.FS;
-    const snap = await getDocs(this.linesCol(sid));
-    let b = writeBatch(window.FS.db), n = 0;
-    for (const d of snap.docs) {
-      b.delete(d.ref);
-      if (++n >= 400) { await b.commit(); b = writeBatch(window.FS.db); n = 0; }
-    }
-    b.delete(doc(this.col(), sid));
-    await b.commit();
-  }
-};
-
-/* ============================================================
    5. SMALL UI PIECES
    ============================================================ */
 function Toast({ toast }) {
@@ -707,8 +394,8 @@ function Login({ dir, onSignIn, dirError }) {
   return (
     <div className="flex min-h-screen items-center justify-center p-4">
       <form onSubmit={submit} className="w-full max-w-sm rounded-xl border bg-white p-6 shadow-sm">
-        <div className="text-[10px] font-bold uppercase tracking-widest text-[#8c909a]">DPM · ReceiptMi</div>
-        <h1 className="mt-1 text-lg font-semibold text-slate-900">Card Statement Receipts</h1>
+        <div className="text-[10px] font-bold uppercase tracking-widest text-[#8c909a]">DPM · StateMi</div>
+        <h1 className="mt-1 text-lg font-semibold text-slate-900">Statement visualizer</h1>
         <p className="mt-1 text-sm text-slate-500">Sign in with your work email and your role password.</p>
         <label className="mt-5 block text-sm"><span className="text-slate-600">Email</span>
           <input type="email" value={email} autoComplete="username" onChange={e => setEmail(e.target.value)}
@@ -725,6 +412,226 @@ function Login({ dir, onSignIn, dirError }) {
   );
 }
 
+
+/* ============================================================
+   3. PAGE PREPARATION — PDF → page images + row rules
+   ============================================================ */
+// Find the horizontal rules Amex prints between rows. Returns their vertical
+// positions as fractions of the page height (0..1), top to bottom.
+function detectRules(canvas) {
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext("2d");
+  const x0 = Math.round(w * 0.05), x1 = Math.round(w * 0.95), span = x1 - x0;
+  const img = ctx.getImageData(x0, 0, span, h).data;
+  const need = span * CFG.pages.ruleMinCoverage, dark = CFG.pages.ruleDarkness;
+  const hits = [];
+  for (let y = 0; y < h; y++) {
+    let n = 0, off = y * span * 4;
+    for (let x = 0; x < span; x++, off += 4) {
+      // quick luminance
+      if ((img[off] * 299 + img[off + 1] * 587 + img[off + 2] * 114) / 1000 < dark) n++;
+    }
+    if (n >= need) hits.push(y);
+  }
+  // merge adjacent pixel rows into one rule
+  const rules = [];
+  hits.forEach(y => {
+    const r = rules[rules.length - 1];
+    if (r && y - r[1] <= 2) r[1] = y; else rules.push([y, y]);
+  });
+  return rules.map(r => +(((r[0] + r[1]) / 2 + 0.5) / h).toFixed(4));
+}
+
+// Given a click position (fraction of page height) and the page's rules,
+// return the row band [y0, y1] the click falls in.
+function bandAt(yFrac, rules) {
+  const P = CFG.pages;
+  let above = -1, below = 2;
+  (rules || []).forEach(r => { if (r <= yFrac && r > above) above = r; if (r > yFrac && r < below) below = r; });
+  if (above >= 0 && below <= 1 && (below - above) <= P.maxBandHeight && (below - above) > 0.004) {
+    return [above, below];
+  }
+  const half = P.defaultBandHeight / 2;
+  return [Math.max(0, yFrac - half), Math.min(1, yFrac + half)];
+}
+
+async function preparePages(file, fs, stmtId, { onProgress, signal }) {
+  if (!window.pdfjsLib) throw new Error("pdf.js didn't load. Check the network and reload.");
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  const report = (stage, pct, detail) => onProgress && onProgress({ stage, pct, detail });
+
+  report("Opening PDF", 2, file.name);
+  const buf = await file.arrayBuffer();
+  const pdf = await window.pdfjsLib.getDocument({ data: buf }).promise;
+  const n = pdf.numPages;
+  const pages = [];
+  const folder = CFG.filestackBasePath + stmtId + "/";
+
+  for (let p = 1; p <= n; p++) {
+    if (signal && signal.aborted) throw new Error("Cancelled");
+    report("Preparing page " + p + " of " + n, 4 + Math.round((p - 1) / n * 90), "rendering");
+    const page = await pdf.getPage(p);
+    const vp1 = page.getViewport({ scale: 1 });
+    const scale = CFG.pages.width / vp1.width;
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(viewport.width); canvas.height = Math.round(viewport.height);
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+    const rules = detectRules(canvas);
+    const blob = await new Promise(res => canvas.toBlob(res, "image/jpeg", CFG.pages.quality));
+
+    report("Preparing page " + p + " of " + n, 4 + Math.round((p - 0.5) / n * 90), "uploading " + fmtBytes(blob.size));
+    let stored = null;
+    if (fs) {
+      const name = "page-" + String(p).padStart(2, "0") + ".jpg";
+      const r = await fs.upload(blob, {}, { path: folder + "pages/" + name, filename: name });
+      stored = { url: r.url, handle: r.handle };
+    } else {
+      // No Filestack: keep the image inline for this session only.
+      stored = { url: URL.createObjectURL(blob), handle: "" };
+    }
+    pages.push({ n: p, url: stored.url, handle: stored.handle, w: canvas.width, h: canvas.height, rules });
+    page.cleanup();
+  }
+  report("Done", 100, n + " pages ready");
+  return { pages, pageCount: n };
+}
+
+/* ============================================================
+   3b. LABEL OCR — read just the clicked strip (best effort)
+   ============================================================ */
+let _ocrWorker = null;
+async function getOcrWorker() {
+  if (!CFG.labelOcr || !window.Tesseract) return null;
+  if (_ocrWorker) return _ocrWorker;
+  _ocrWorker = (async () => {
+    const w = await window.Tesseract.createWorker("eng", 1, {});
+    await w.setParameters({ preserve_interword_spaces: "1", tessedit_pageseg_mode: "6" });
+    return w;
+  })();
+  return _ocrWorker;
+}
+const fixDigits = s => s.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1").replace(/S/g, "5");
+function parseAmount(tok) {
+  const t = fixDigits(tok.replace(/[^\d$.,\-]/g, ""));
+  let m = t.match(/^(-)?\$?(\d{1,3}(?:,\d{3})*|\d+)\.(\d{2})$/) ||
+          t.match(/^(-)?\$(\d{1,3}(?:,\d{3})*|\d+)[.,](\d{2})\d?$/);
+  if (!m) return null;
+  const v = parseFloat(m[2].replace(/,/g, "") + "." + m[3]);
+  return m[1] ? -v : v;
+}
+function labelFromText(text) {
+  const first = (text || "").split("\n").map(s => s.trim()).filter(Boolean)[0] || "";
+  const toks = first.split(/\s+/);
+  let date = "", amount = null;
+  if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(fixDigits(toks[0] || ""))) date = fixDigits(toks.shift());
+  for (let i = toks.length - 1; i >= Math.max(0, toks.length - 3); i--) {
+    const a = parseAmount(toks[i]); if (a !== null) { amount = a; toks.splice(i); break; }
+  }
+  const desc = toks.join(" ").replace(/(^|\s)1?T?™X?(?=\s|$)/g, "$1TX").replace(/[^\w\s*#&'./@:+-]/g, "")
+    .replace(/\s+/g, " ").trim().slice(0, 80);
+  return { date, desc, amount };
+}
+// Crops the band from the page image and OCRs it. Resolves to {date, desc, amount}
+// or null if anything at all goes wrong (CORS, missing library, …).
+async function readBand(pageImgUrl, band) {
+  try {
+    const worker = await getOcrWorker();
+    if (!worker) return null;
+    const img = await new Promise((res, rej) => { const i = new Image(); i.crossOrigin = "anonymous"; i.onload = () => res(i); i.onerror = rej; i.src = pageImgUrl; });
+    const W = img.naturalWidth, H = img.naturalHeight;
+    const y0 = Math.round(band[0] * H), y1 = Math.round(band[1] * H);
+    const c = document.createElement("canvas");
+    c.width = Math.round(W * 0.92); c.height = Math.max(8, y1 - y0);
+    c.getContext("2d").drawImage(img, Math.round(W * 0.04), y0, c.width, c.height, 0, 0, c.width, c.height);
+    const { data } = await worker.recognize(c);
+    return labelFromText(data.text);
+  } catch (e) { return null; }
+}
+
+/* ============================================================
+   4. FIRESTORE SERVICE
+   ============================================================ */
+const svc = {
+  col() { return window.FS.collection(window.FS.db, CFG.statementsCollection); },
+  linesCol(sid) { return window.FS.collection(window.FS.db, CFG.statementsCollection, sid, "lines"); },
+
+  subscribeStatements(cb, onErr) {
+    const { query, orderBy, onSnapshot } = window.FS;
+    return onSnapshot(query(this.col(), orderBy("createdAt", "desc")),
+      snap => cb(snap.docs.map(d => ({ id: d.id, ...d.data() }))), onErr);
+  },
+  cache: {},   // sid -> latest lines from the live subscription (for counter sync)
+  subscribeLines(sid, cb, onErr) {
+    const { onSnapshot } = window.FS;
+    return onSnapshot(this.linesCol(sid),
+      snap => { const xs = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.page - b.page) || (a.y0 - b.y0)); this.cache[sid] = xs; cb(xs); }, onErr);
+  },
+
+  stats(lines) {
+    const s = { done: 0, skip: 0, todo: 0, total: 0 };
+    (lines || []).forEach(l => { s[lineStatus(l)]++; s.total += (+l.amount || 0); });
+    return s;
+  },
+  async syncCounts(sid, lines) {
+    const { doc, updateDoc, serverTimestamp } = window.FS;
+    const s = this.stats(lines);
+    try { await updateDoc(doc(this.col(), sid), { lineCount: lines.length, doneCount: s.done, skipCount: s.skip, total: s.total, updatedAt: serverTimestamp() }); } catch (e) {}
+  },
+
+  async createStatement(meta, session) {
+    const { doc, setDoc, serverTimestamp } = window.FS;
+    const sref = doc(this.col(), meta.id);
+    const { id, ...rest } = meta;
+    await setDoc(sref, cleanForFirestore({
+      ...rest, lineCount: 0, doneCount: 0, skipCount: 0, total: 0, status: "ready",
+      createdBy: { id: session.id, name: session.name, email: session.email },
+      createdAt: serverTimestamp(), updatedAt: serverTimestamp()
+    }));
+    return sref.id;
+  },
+  async updateStatement(sid, patch) {
+    const { doc, updateDoc, serverTimestamp } = window.FS;
+    await updateDoc(doc(this.col(), sid), cleanForFirestore({ ...patch, updatedAt: serverTimestamp() }));
+  },
+
+  async addLine(sid, line, session, allLines) {
+    const { doc, setDoc, serverTimestamp } = window.FS;
+    const lref = doc(this.linesCol(sid), line.id);
+    const { id, ...rest } = line;
+    const data = cleanForFirestore({ attachments: [], note: "", noReceipt: false, desc: "", amount: null, date: "", ...rest,
+      createdBy: { id: session.id, name: session.name }, createdAt: Date.now(),
+      updatedAt: serverTimestamp(), updatedBy: { id: session.id, name: session.name } });
+    await setDoc(lref, data);
+    this.syncCounts(sid, [...(this.cache[sid] || allLines || []).filter(l => l.id !== line.id), { ...data, id: line.id }]);
+  },
+  async updateLine(sid, lid, patch, session, allLines) {
+    const { doc, updateDoc, serverTimestamp } = window.FS;
+    await updateDoc(doc(this.linesCol(sid), lid), cleanForFirestore({
+      ...patch, updatedAt: serverTimestamp(), updatedBy: { id: session.id, name: session.name }
+    }));
+    const base = this.cache[sid] || allLines;
+    if (base) this.syncCounts(sid, base.map(l => l.id === lid ? { ...l, ...patch } : l));
+  },
+  async deleteLine(sid, lid, allLines) {
+    const { doc, deleteDoc } = window.FS;
+    await deleteDoc(doc(this.linesCol(sid), lid));
+    this.syncCounts(sid, (this.cache[sid] || allLines || []).filter(l => l.id !== lid));
+  },
+  async deleteStatement(sid) {
+    const { getDocs, writeBatch, doc } = window.FS;
+    const snap = await getDocs(this.linesCol(sid));
+    let b = writeBatch(window.FS.db), n = 0;
+    for (const d of snap.docs) {
+      b.delete(d.ref);
+      if (++n >= 400) { await b.commit(); b = writeBatch(window.FS.db); n = 0; }
+    }
+    b.delete(doc(this.col(), sid));
+    await b.commit();
+  }
+};
+
 /* ============================================================
    7. STATEMENT LIST
    ============================================================ */
@@ -734,7 +641,7 @@ function StatementList({ statements, loading, session, onOpen, onNew, onDelete }
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-xl font-semibold text-slate-900">Statements</h2>
-          <p className="text-sm text-slate-500">Upload a statement, then attach a receipt to every line.</p>
+          <p className="text-sm text-slate-500">Open a statement, click a line, attach its receipt. Hover any marked line to see what's attached.</p>
         </div>
         {isManager(session) && (
           <button onClick={onNew} className="rounded-lg bg-[#2a5f9e] px-4 py-2 text-sm font-medium text-white hover:bg-[#234f84]">
@@ -757,19 +664,18 @@ function StatementList({ statements, loading, session, onOpen, onNew, onDelete }
               <div className="flex items-start justify-between gap-2">
                 <div>
                   <div className="font-semibold text-slate-900">{s.title || "Statement"}</div>
-                  <div className="text-xs text-slate-500">
-                    {s.cardName || "Card"}{s.accountEnding ? " · ending " + s.accountEnding : ""}
-                    {s.closingDate ? " · closes " + s.closingDate : ""}
-                  </div>
+                  <div className="text-xs text-slate-500">{s.pageCount || 0} pages{s.closingDate ? " · closes " + s.closingDate : ""}</div>
                 </div>
-                {open === 0
-                  ? <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">Complete</span>
-                  : <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800">{open} open</span>}
+                {!s.lineCount
+                  ? <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-600">Nothing marked yet</span>
+                  : open === 0
+                    ? <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">Complete</span>
+                    : <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800">{open} waiting</span>}
               </div>
               <div className="mt-3"><Progress done={s.doneCount} skip={s.skipCount} total={s.lineCount} /></div>
               <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
-                <span>{s.doneCount || 0} attached · {s.skipCount || 0} skipped · {s.lineCount || 0} lines</span>
-                <span>{money(s.total)}</span>
+                <span>{s.doneCount || 0} attached · {s.skipCount || 0} no receipt · {s.lineCount || 0} marked</span>
+                <span>{s.total ? money(s.total) : ""}</span>
               </div>
               <div className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
                 <span>{s.createdBy && s.createdBy.name} · {fmtDate(s.createdAt)}</span>
@@ -786,34 +692,33 @@ function StatementList({ statements, loading, session, onOpen, onNew, onDelete }
 }
 
 /* ============================================================
-   8. NEW STATEMENT — pick → OCR → review → save
+   8. NEW STATEMENT — pick → prepare pages → name it
    ============================================================ */
-function NewStatement({ session, fs, onDone, onCancel, toast }) {
-  const [step, setStep] = useState("pick");       // pick | working | review | saving
+function NewStatement({ session, fs, onDone, onCancel, toast, onPermError }) {
+  const [step, setStep] = useState("pick");       // pick | working | name | saving
   const [file, setFile] = useState(null);
   const [prog, setProg] = useState({ stage: "", pct: 0, detail: "" });
   const [upload, setUpload] = useState({ pct: 0, done: null, err: "" });
-  const [items, setItems] = useState([]);
-  const [meta, setMeta] = useState({ title: "", cardName: "", accountEnding: "", closingDate: "", primaryName: "" });
+  const [prepared, setPrepared] = useState(null);
+  const [meta, setMeta] = useState({ title: "", closingDate: "", cardName: "" });
   const [err, setErr] = useState("");
   const abortRef = useRef(null);
   const fileInput = useRef(null);
+  const stmtId = useMemo(() => uid(), []);
 
   function onPick(f) {
     if (!f) return;
     if (f.type !== "application/pdf" && !/\.pdf$/i.test(f.name)) { setErr("Please choose a PDF statement."); return; }
     setErr(""); setFile(f);
+    setMeta(m => ({ ...m, title: m.title || f.name.replace(/\.pdf$/i, "") }));
   }
 
   async function start() {
     if (!file) return;
     setStep("working"); setErr("");
     const ac = new AbortController(); abortRef.current = ac;
-
-    // Upload the original PDF to Filestack in parallel with OCR.
-    const stmtId = uid();
     const uploadP = (async () => {
-      if (!fs) { setUpload(u => ({ ...u, err: "Filestack didn't load — the PDF won't be stored." })); return null; }
+      if (!fs) { setUpload(u => ({ ...u, err: "Filestack didn't load — the original PDF won't be stored." })); return null; }
       try {
         const r = await fs.upload(file, { onProgress: e => setUpload(u => ({ ...u, pct: e.totalPercent || 0 })) },
                                   { path: CFG.filestackBasePath + stmtId + "/statement.pdf", filename: "statement.pdf" });
@@ -822,62 +727,32 @@ function NewStatement({ session, fs, onDone, onCancel, toast }) {
         return done;
       } catch (e) { setUpload(u => ({ ...u, err: "PDF upload failed: " + (e.message || e) })); return null; }
     })();
-
     try {
-      const res = await processStatementPdf(file, { onProgress: setProg, signal: ac.signal });
-      const lines = res.items.map((it, i) => ({
-        ...it, seq: i + 1, id: uid(),
-        cardholder: it.cardholder || res.meta.primaryName || "",
-        noReceipt: CFG.ocr.autoNoReceipt.some(re => re.test(it.desc)) || (it.amount !== null && it.amount < 0),
-        noReceiptReason: ""
-      }));
-      lines.forEach(l => { if (l.noReceipt) l.noReceiptReason = l.amount < 0 ? "Credit / payment" : "Fee or payment"; });
-      setItems(lines);
-      const cd = res.meta.closingDate || "";
-      setMeta({
-        title: (res.meta.cardName || "Statement") + (cd ? " — " + cd : "") + (res.meta.accountEnding ? " (…" + res.meta.accountEnding.slice(-5) + ")" : ""),
-        cardName: res.meta.cardName || "", accountEnding: res.meta.accountEnding || "",
-        closingDate: cd, primaryName: res.meta.primaryName || "", pageCount: res.pageCount, stmtId
-      });
-      setStep("review");
-    } catch (e) {
-      setErr(e.message || String(e)); setStep("pick");
-    }
+      const res = await preparePages(file, fs, stmtId, { onProgress: setProg, signal: ac.signal });
+      setPrepared(res);
+      setStep("name");
+    } catch (e) { setErr(e.message || String(e)); setStep("pick"); }
     await uploadP;
+  }
+
+  async function save() {
+    if (!meta.title.trim()) { setErr("Give the statement a name."); return; }
+    setStep("saving"); setErr("");
+    try {
+      await svc.createStatement({ id: stmtId, title: meta.title.trim(), closingDate: meta.closingDate.trim(), cardName: meta.cardName.trim(),
+        pdf: upload.done || null, pages: prepared.pages, pageCount: prepared.pageCount,
+        filestackFolder: CFG.filestackBasePath + stmtId + "/" }, session);
+      toast("Statement ready — click a line to mark it.", "ok");
+      onDone(stmtId);
+    } catch (e) { setErr(explainError(e, "Save")); setStep("name"); if (isPermissionError(e)) onPermError && onPermError(); }
   }
 
   function cancel() { if (abortRef.current) abortRef.current.abort(); onCancel(); }
 
-  // --- review editing ---
-  const upd = (id, patch) => setItems(xs => xs.map(x => x.id === id ? { ...x, ...patch } : x));
-  const del = id => setItems(xs => xs.filter(x => x.id !== id));
-  const addRow = () => setItems(xs => [...xs, { id: uid(), seq: xs.length + 1, date: "", desc: "", amount: null, extra: [],
-                                                cardholder: meta.primaryName, page: null, noReceipt: false, manual: true }]);
-  const totals = useMemo(() => svc.stats(items), [items]);
-  const reviewCount = items.filter(x => x.needsReview || x.amount === null || !x.date || !x.desc).length;
-
-  async function save() {
-    if (!items.length) { setErr("There are no lines to save."); return; }
-    setStep("saving"); setErr("");
-    try {
-      const lines = items.map((x, i) => {
-        const { id, manual, ...rest } = x;
-        return { ...rest, seq: i + 1, amount: x.amount === "" ? null : x.amount, needsReview: !!x.needsReview && (x.amount === null || !x.desc) };
-      });
-      const { stmtId, ...m } = meta;
-      const sid = await svc.createStatement({ ...m, pdf: upload.done || null, filestackFolder: CFG.filestackBasePath + stmtId + "/" }, lines, session);
-      toast("Statement saved — " + lines.length + " lines.", "ok");
-      onDone(sid);
-    } catch (e) { setErr("Save failed: " + (e.message || e)); setStep("review"); }
-  }
-
   if (step === "pick") return (
     <div className="mx-auto max-w-xl">
       <h2 className="text-xl font-semibold text-slate-900">New statement</h2>
-      <p className="mt-1 text-sm text-slate-500">
-        Choose the statement PDF. Each page is read right here in your browser, so a long scanned statement
-        can take a couple of minutes — leave the tab open.
-      </p>
+      <p className="mt-1 text-sm text-slate-500">Choose the statement PDF. Each page is turned into an image you'll click on — a 15-page statement takes about half a minute.</p>
       <div onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); onPick(e.dataTransfer.files[0]); }}
            onClick={() => fileInput.current.click()}
            className="mt-4 cursor-pointer rounded-xl border-2 border-dashed border-slate-300 bg-white p-10 text-center hover:border-[#2a5f9e]">
@@ -886,9 +761,9 @@ function NewStatement({ session, fs, onDone, onCancel, toast }) {
           ? <div><div className="font-medium text-slate-900">{file.name}</div><div className="text-xs text-slate-500">{fmtBytes(file.size)}</div></div>
           : <div className="text-sm text-slate-500"><div className="text-3xl">📄</div>Drop the PDF here or click to choose</div>}
       </div>
-      {err && <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{err}</p>}
+      {err && <p className="mt-3 whitespace-pre-line rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{err}</p>}
       <div className="mt-4 flex gap-2">
-        <button onClick={start} disabled={!file} className="rounded-lg bg-[#2a5f9e] px-4 py-2 text-sm font-medium text-white disabled:opacity-40">Read statement</button>
+        <button onClick={start} disabled={!file} className="rounded-lg bg-[#2a5f9e] px-4 py-2 text-sm font-medium text-white disabled:opacity-40">Prepare statement</button>
         <button onClick={onCancel} className="rounded-lg border px-4 py-2 text-sm text-slate-700">Cancel</button>
       </div>
     </div>
@@ -896,7 +771,7 @@ function NewStatement({ session, fs, onDone, onCancel, toast }) {
 
   if (step === "working") return (
     <div className="mx-auto max-w-xl rounded-xl border bg-white p-6">
-      <h2 className="text-lg font-semibold text-slate-900">Reading {file.name}</h2>
+      <h2 className="text-lg font-semibold text-slate-900">Preparing {file.name}</h2>
       <div className="mt-4 text-sm font-medium text-slate-800">{prog.stage}</div>
       <div className="text-xs text-slate-500">{prog.detail}</div>
       <div className="mt-2 h-2.5 w-full overflow-hidden rounded-full bg-slate-200">
@@ -911,197 +786,295 @@ function NewStatement({ session, fs, onDone, onCancel, toast }) {
     </div>
   );
 
-  // review | saving
   return (
-    <div>
-      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="text-xl font-semibold text-slate-900">Review the lines</h2>
-          <p className="text-sm text-slate-500">
-            {items.length} lines found across {meta.pageCount} pages · total {money(totals.total)}.
-            {reviewCount > 0 && <span className="ml-1 font-medium text-amber-700">{reviewCount} need a look (highlighted).</span>}
-            {" "}Compare each row with the strip of the statement next to it, fix anything the OCR got wrong, then save.
-          </p>
-        </div>
-        <div className="flex gap-2">
-          <button onClick={onCancel} className="rounded-lg border px-4 py-2 text-sm text-slate-700">Discard</button>
-          <button onClick={save} disabled={step === "saving"} className="rounded-lg bg-[#2a5f9e] px-4 py-2 text-sm font-medium text-white disabled:opacity-50">
-            {step === "saving" ? "Saving…" : "Save statement"}
-          </button>
-        </div>
+    <div className="mx-auto max-w-xl rounded-xl border bg-white p-6">
+      <h2 className="text-lg font-semibold text-slate-900">Name the statement</h2>
+      <p className="mt-1 text-sm text-slate-500">{prepared.pageCount} pages ready.</p>
+      {err && <p className="mt-3 whitespace-pre-line rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{err}</p>}
+      {upload.err && <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800">{upload.err}</p>}
+      <label className="mt-4 block text-sm"><span className="text-slate-600">Title</span>
+        <input autoFocus value={meta.title} onChange={e => setMeta(m => ({ ...m, title: e.target.value }))}
+               placeholder="e.g. Amex Business Platinum — Aug 2026" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" /></label>
+      <div className="mt-3 grid grid-cols-2 gap-3">
+        <label className="block text-sm"><span className="text-slate-600">Closing date</span>
+          <input value={meta.closingDate} onChange={e => setMeta(m => ({ ...m, closingDate: e.target.value }))}
+                 placeholder="MM/DD/YY" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" /></label>
+        <label className="block text-sm"><span className="text-slate-600">Card (optional)</span>
+          <input value={meta.cardName} onChange={e => setMeta(m => ({ ...m, cardName: e.target.value }))}
+                 placeholder="Business Platinum …21007" className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" /></label>
       </div>
-      {err && <p className="mb-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{err}</p>}
-      {upload.err && <p className="mb-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800">{upload.err} The lines will still be saved.</p>}
-
-      <div className="mb-4 grid gap-3 rounded-xl border bg-white p-4 md:grid-cols-4">
-        {[["title", "Title"], ["cardName", "Card"], ["accountEnding", "Account ending"], ["closingDate", "Closing date"]].map(([k, label]) => (
-          <label key={k} className="block text-xs text-slate-600">{label}
-            <input value={meta[k] || ""} onChange={e => setMeta(m => ({ ...m, [k]: e.target.value }))}
-                   className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm text-slate-900" />
-          </label>
-        ))}
+      <div className="mt-4 grid grid-cols-6 gap-1">
+        {prepared.pages.slice(0, 12).map(p => <img key={p.n} src={p.url} className="rounded border" alt="" />)}
       </div>
-
-      <div className="overflow-x-auto rounded-xl border bg-white">
-        <table className="w-full text-sm">
-          <thead className="bg-slate-50 text-left text-[11px] uppercase tracking-wider text-slate-500">
-            <tr><th className="px-3 py-2">#</th><th className="px-3 py-2">Date</th><th className="px-3 py-2">Description</th>
-                <th className="px-3 py-2">Cardholder</th><th className="px-3 py-2 text-right">Amount</th>
-                <th className="px-3 py-2">On statement</th><th className="px-3 py-2">Receipt</th><th></th></tr>
-          </thead>
-          <tbody>
-            {items.map((it, i) => {
-              const bad = it.needsReview || it.amount === null || !it.date || !it.desc;
-              return (
-                <tr key={it.id} className={"border-t align-top " + (bad ? "row-review" : "")}>
-                  <td className="px-3 py-2 text-slate-400">{i + 1}</td>
-                  <td className="px-3 py-2"><input value={it.date} onChange={e => upd(it.id, { date: e.target.value })} className="w-24 rounded border border-slate-300 px-2 py-1" /></td>
-                  <td className="px-3 py-2">
-                    <input value={it.desc} onChange={e => upd(it.id, { desc: e.target.value })} className="w-full min-w-[220px] rounded border border-slate-300 px-2 py-1" />
-                    {it.extra && it.extra.length > 0 && <div className="mt-0.5 text-[11px] text-slate-400">{it.extra.join(" · ")}</div>}
-                  </td>
-                  <td className="px-3 py-2"><input value={it.cardholder || ""} onChange={e => upd(it.id, { cardholder: e.target.value })} className="w-32 rounded border border-slate-300 px-2 py-1" /></td>
-                  <td className="px-3 py-2 text-right">
-                    <input type="number" step="0.01" value={it.amount === null ? "" : it.amount}
-                           onChange={e => upd(it.id, { amount: e.target.value === "" ? null : parseFloat(e.target.value), needsReview: false })}
-                           className="w-28 rounded border border-slate-300 px-2 py-1 text-right" />
-                  </td>
-                  <td className="px-3 py-2">{it.snip ? <img src={it.snip} className="snip max-w-[340px]" alt="" /> : <span className="text-xs text-slate-400">manual</span>}</td>
-                  <td className="px-3 py-2">
-                    <label className="flex items-center gap-1 whitespace-nowrap text-xs text-slate-600">
-                      <input type="checkbox" checked={!!it.noReceipt} onChange={e => upd(it.id, { noReceipt: e.target.checked })} /> not needed
-                    </label>
-                  </td>
-                  <td className="px-2 py-2"><button onClick={() => del(it.id)} className="text-xs text-red-500 hover:underline">remove</button></td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-        <div className="border-t p-3"><button onClick={addRow} className="text-sm text-[#2a5f9e] hover:underline">+ Add a line the OCR missed</button></div>
+      <div className="mt-5 flex gap-2">
+        <button onClick={save} disabled={step === "saving"} className="rounded-lg bg-[#2a5f9e] px-4 py-2 text-sm font-medium text-white disabled:opacity-50">
+          {step === "saving" ? "Saving…" : "Open statement"}
+        </button>
+        <button onClick={onCancel} className="rounded-lg border px-4 py-2 text-sm text-slate-700">Discard</button>
       </div>
     </div>
   );
 }
 
 /* ============================================================
-   9. STATEMENT VIEW — attach, note, flag, hover to preview
+   9. STATEMENT VIEWER — pages, bands, hover card, side panel
    ============================================================ */
 function HoverCard({ hover }) {
   if (!hover) return null;
   const { line, x, y } = hover;
   const atts = line.attachments || [];
-  const W = 420;
-  const left = Math.min(x + 16, window.innerWidth - W - 12);
-  const top = Math.min(y + 16, window.innerHeight - 320);
+  const W = Math.min(440, window.innerWidth - 24);
+  const left = Math.min(x + 18, window.innerWidth - W - 12);
+  const top = Math.min(y + 18, window.innerHeight - 260);
   return (
     <div className="hovercard fixed z-40 rounded-xl border bg-white p-3 shadow-xl" style={{ left, top, width: W }}>
-      {line.snip && <img src={line.snip} className="snip mb-2 w-full" alt="" />}
-      <div className="mb-2 flex items-center justify-between text-xs">
-        <span className="font-medium text-slate-800">{line.desc}</span>
-        <span className="font-semibold">{money(line.amount)}</span>
+      <div className="mb-2 flex items-start justify-between gap-3 text-xs">
+        <span className="font-medium text-slate-800">{line.desc || "Marked line"}{line.date ? <span className="ml-1 text-slate-400">· {line.date}</span> : null}</span>
+        {line.amount !== null && line.amount !== undefined && <span className="font-semibold">{money(line.amount)}</span>}
       </div>
       {line.note && <div className="mb-2 rounded bg-amber-50 px-2 py-1 text-xs text-amber-900">📝 {line.note}</div>}
       {line.noReceipt && <div className="text-xs text-slate-500">No receipt needed{line.noReceiptReason ? " — " + line.noReceiptReason : ""}.</div>}
-      {!line.noReceipt && !atts.length && <div className="text-xs text-amber-700">No receipt attached yet — click the row to attach one.</div>}
-      {atts.length > 0 && (
-        <div className="flex flex-wrap gap-2">
-          {atts.map((a, i) => <AttachmentThumb key={i} att={a} />)}
+      {!line.noReceipt && !atts.length && <div className="text-xs text-amber-700">Nothing attached yet — click to attach.</div>}
+      {atts.length > 0 && <div className="flex flex-wrap gap-2">{atts.map((a, i) => <AttachmentThumb key={i} att={a} />)}</div>}
+    </div>
+  );
+}
+
+function LinePanel({ statement, line, lines, session, fs, onClose, toast }) {
+  const [note, setNote] = useState(line.note || "");
+  const [desc, setDesc] = useState(line.desc || "");
+  const [amount, setAmount] = useState(line.amount === null || line.amount === undefined ? "" : String(line.amount));
+  const [busy, setBusy] = useState(false);
+  // Follow the line when it changes underneath us (another user, or the
+  // background label OCR) — but never clobber text the user is typing.
+  const prev = useRef({});
+  useEffect(() => {
+    const pa = line.amount === null || line.amount === undefined ? "" : String(line.amount);
+    const fresh = prev.current.id !== line.id;
+    if (fresh || desc === (prev.current.desc || "")) setDesc(line.desc || "");
+    if (fresh || amount === (prev.current.amount || "")) setAmount(pa);
+    if (fresh || note === (prev.current.note || "")) setNote(line.note || "");
+    prev.current = { id: line.id, desc: line.desc || "", amount: pa, note: line.note || "" };
+  }, [line.id, line.desc, line.amount, line.note]);
+  useEffect(() => {
+    const h = e => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", h); return () => window.removeEventListener("keydown", h);
+  }, []);
+  const atts = line.attachments || [];
+  const st = lineStatus(line);
+
+  function attach() {
+    if (!fs) { toast("Upload isn't available — the Filestack script didn't load.", "err"); return; }
+    setBusy(true);
+    openPicker(fs, statement, line, session, lines, toast, () => setBusy(false));
+  }
+  async function patch(p) { try { await svc.updateLine(statement.id, line.id, p, session, lines); } catch (e) { toast(explainError(e, "Saving"), "err"); } }
+  async function removeAtt(i) {
+    if (!confirm("Remove this document from the line? (The file stays in Filestack.)")) return;
+    patch({ attachments: atts.filter((_, k) => k !== i) });
+  }
+  async function toggleNoReceipt() {
+    if (line.noReceipt) return patch({ noReceipt: false, noReceiptReason: "" });
+    const reason = prompt("Why is no receipt needed? (optional)", line.noReceiptReason || "");
+    if (reason === null) return;
+    patch({ noReceipt: true, noReceiptReason: reason });
+  }
+  async function del() {
+    if (!confirm("Remove this marked line" + (atts.length ? " and its " + atts.length + " attachment link(s)" : "") + "?")) return;
+    try { await svc.deleteLine(statement.id, line.id, lines); onClose(); } catch (e) { toast(explainError(e, "Delete"), "err"); }
+  }
+  const saveLabel = () => {
+    const a = amount.trim() === "" ? null : parseFloat(amount);
+    if (desc !== (line.desc || "") || a !== (line.amount === undefined ? null : line.amount)) patch({ desc: desc.trim(), amount: isNaN(a) ? null : a });
+  };
+
+  return (
+    <aside className="fixed inset-y-0 right-0 z-30 flex w-full max-w-md flex-col border-l bg-white shadow-2xl">
+      <div className="flex items-start justify-between gap-3 border-b px-4 py-3">
+        <div className="min-w-0">
+          <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Page {line.page}</div>
+          <Chip status={st} />
         </div>
-      )}
+        <button onClick={onClose} className="rounded-lg px-2 py-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700" title="Close (Esc)">✕</button>
+      </div>
+      <div className="flex-1 overflow-y-auto px-4 py-3">
+        <div className="grid grid-cols-[1fr_110px] gap-2">
+          <label className="block text-[11px] text-slate-500">Label
+            <input value={desc} onChange={e => setDesc(e.target.value)} onBlur={saveLabel} placeholder={line.reading ? "Reading the line…" : "Merchant / what this is"}
+                   className="mt-0.5 w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm text-slate-900" /></label>
+          <label className="block text-[11px] text-slate-500">Amount
+            <input type="number" step="0.01" value={amount} onChange={e => setAmount(e.target.value)} onBlur={saveLabel}
+                   className="mt-0.5 w-full rounded-lg border border-slate-300 px-2 py-1.5 text-right text-sm text-slate-900" /></label>
+        </div>
+        {line.date && <div className="mt-1 text-[11px] text-slate-400">Transaction date {line.date}</div>}
+
+        <div className="mt-4 mb-2 flex items-center justify-between">
+          <div className="text-xs font-semibold uppercase tracking-wider text-slate-500">Documents ({atts.length})</div>
+          <button onClick={attach} disabled={busy} className="rounded-lg bg-[#2a5f9e] px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50">{busy ? "…" : "+ Attach"}</button>
+        </div>
+        {!atts.length && <div className="rounded-lg border border-dashed p-4 text-center text-sm text-slate-500">No receipt or supporting document yet.</div>}
+        <div className="flex flex-wrap gap-3">
+          {atts.map((a, i) => (
+            <div key={i} className="relative">
+              <AttachmentThumb att={a} size="lg" />
+              <div className="text-[10px] text-slate-400">{fmtBytes(a.size)}{a.uploadedBy ? " · " + a.uploadedBy : ""}</div>
+              <button onClick={() => removeAtt(i)} className="absolute -right-1 -top-1 h-5 w-5 rounded-full bg-white text-xs text-red-500 shadow hover:bg-red-50" title="Remove">✕</button>
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-4 text-xs font-semibold uppercase tracking-wider text-slate-500">Note</div>
+        <textarea value={note} onChange={e => setNote(e.target.value)} onBlur={() => { if (note !== (line.note || "")) patch({ note }); }}
+                  rows="3" placeholder="Store #, purpose, who it was for…" className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm" />
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button onClick={toggleNoReceipt} className="rounded-lg border bg-white px-3 py-1.5 text-xs text-slate-700">
+            {line.noReceipt ? "Receipt is needed after all" : "No receipt needed"}
+          </button>
+          {statement.pdf && <a href={statement.pdf.url + "#page=" + line.page} target="_blank" rel="noopener" className="rounded-lg border bg-white px-3 py-1.5 text-xs text-slate-700">Original PDF p.{line.page} ↗</a>}
+          <button onClick={del} className="ml-auto text-xs text-red-500 hover:underline">Remove mark</button>
+        </div>
+        {line.updatedBy && <div className="mt-3 text-[11px] text-slate-400">Last updated by {line.updatedBy.name} · {fmtDate(line.updatedAt)}</div>}
+      </div>
+    </aside>
+  );
+}
+
+// Shared Filestack picker for a line. `done` is called when the picker closes.
+function openPicker(fs, statement, line, session, lines, toast, done) {
+  fs.picker({
+    accept: ["application/pdf", "image/*", ".heic", ".doc", ".docx", ".xls", ".xlsx", ".eml", ".msg"],
+    maxFiles: 10,
+    fromSources: ["local_file_system", "googledrive", "dropbox", "onedrive", "url"],
+    storeTo: { path: (statement.filestackFolder || (CFG.filestackBasePath + statement.id + "/")) + line.id + "/" },
+    onUploadDone: async r => {
+      done && done();
+      const files = (r.filesUploaded || []).map(f => ({
+        url: f.url, handle: f.handle, name: f.filename, size: f.size, mimetype: f.mimetype,
+        uploadedBy: session.name, uploadedAt: Date.now()
+      }));
+      if (!files.length) return;
+      try {
+        const current = (lines || []).find(l => l.id === line.id) || line;
+        await svc.updateLine(statement.id, line.id, { attachments: [...(current.attachments || []), ...files] }, session, lines);
+        toast(files.length + (files.length > 1 ? " files attached" : " file attached"), "ok");
+      } catch (e) { toast(explainError(e, "Saving the attachment"), "err"); }
+    },
+    onFileUploadFailed: (f, e) => { done && done(); toast("Upload failed: " + ((e && e.message) || "unknown error"), "err"); },
+    onClose: () => done && done()
+  }).open();
+}
+
+function StatementPage({ page, lines, zoom, activeId, onHoverLine, onLeaveLine, onClickLine, onClickEmpty }) {
+  const ref = useRef(null);
+  const [ghost, setGhost] = useState(null);
+  const pageLines = lines.filter(l => l.page === page.n);
+
+  function yFrac(e) {
+    const r = ref.current.getBoundingClientRect();
+    return Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+  }
+  function onMove(e) {
+    if (e.target.closest(".band")) { setGhost(null); return; }
+    const band = bandAt(yFrac(e), page.rules);
+    // don't offer a ghost where a line already exists
+    if (pageLines.some(l => band[0] < l.y1 && band[1] > l.y0)) { setGhost(null); return; }
+    setGhost(band);
+  }
+  return (
+    <div className="mx-auto" style={{ width: zoom + "%" }}>
+      <div className="mb-1 flex items-center justify-between px-1 text-[11px] text-slate-400">
+        <span>Page {page.n}</span>
+        <span>{pageLines.length ? pageLines.length + " marked" : ""}</span>
+      </div>
+      <div ref={ref} className="page" onMouseMove={onMove} onMouseLeave={() => setGhost(null)}
+           onClick={e => { if (e.target.closest(".band")) return; const b = bandAt(yFrac(e), page.rules);
+                           if (pageLines.some(l => b[0] < l.y1 && b[1] > l.y0)) return; setGhost(null); onClickEmpty(page, b); }}>
+        <img src={page.url} alt={"Statement page " + page.n} loading={page.n <= 2 ? "eager" : "lazy"} draggable="false"
+             style={{ aspectRatio: page.w + " / " + page.h }} />
+        {ghost && <div className="band-ghost" style={{ top: ghost[0] * 100 + "%", height: (ghost[1] - ghost[0]) * 100 + "%" }}>
+          <span className="badge" style={{ background: "#2a5f9e" }}>+ click to mark</span>
+        </div>}
+        {pageLines.map(l => {
+          const st = lineStatus(l), n = (l.attachments || []).length;
+          return (
+            <div key={l.id} className={"band band-" + st + (activeId === l.id ? " band-active" : "")}
+                 style={{ top: l.y0 * 100 + "%", height: (l.y1 - l.y0) * 100 + "%" }}
+                 onMouseEnter={e => onHoverLine(l, e)} onMouseMove={e => onHoverLine(l, e)} onMouseLeave={onLeaveLine}
+                 onClick={e => { e.stopPropagation(); onClickLine(l); }}>
+              <span className={"badge badge-" + st}>{st === "skip" ? "no receipt" : n ? "📎 " + n : "needs receipt"}</span>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
 
 function StatementView({ statement, session, fs, onBack, toast }) {
   const [lines, setLines] = useState(null);
-  const [filter, setFilter] = useState("all");
-  const [q, setQ] = useState("");
-  const [holder, setHolder] = useState("");
   const [hover, setHover] = useState(null);
-  const [openId, setOpenId] = useState(null);
-  const [busyId, setBusyId] = useState(null);
-  const [noteDraft, setNoteDraft] = useState({});
-  const [adding, setAdding] = useState(false);
-  const [newLine, setNewLine] = useState({ date: "", desc: "", amount: "" });
+  const [activeId, setActiveId] = useState(null);
+  const [zoom, setZoom] = useState(() => { try { return +localStorage.getItem("statemi_zoom") || 100; } catch (e) { return 100; } });
+  const [showList, setShowList] = useState(() => window.innerWidth > 1100);
+  const [filter, setFilter] = useState("all");
+  const [reading, setReading] = useState({});
+  const pageRefs = useRef({});
 
   useEffect(() => {
-    const un = svc.subscribeLines(statement.id, setLines, e => toast("Couldn't load lines: " + e.message, "err"));
+    const un = svc.subscribeLines(statement.id, setLines, e => toast(explainError(e, "Loading lines"), "err"));
     return un;
   }, [statement.id]);
+  useEffect(() => { try { localStorage.setItem("statemi_zoom", String(zoom)); } catch (e) {} }, [zoom]);
 
-  const holders = useMemo(() => [...new Set((lines || []).map(l => l.cardholder).filter(Boolean))].sort(), [lines]);
   const stats = useMemo(() => svc.stats(lines || []), [lines]);
-  const shown = useMemo(() => {
-    const t = q.trim().toLowerCase();
-    return (lines || []).filter(l => {
-      const st = lineStatus(l);
-      if (filter !== "all" && st !== filter) return false;
-      if (holder && l.cardholder !== holder) return false;
-      if (t && !((l.desc || "") + " " + (l.extra || []).join(" ") + " " + (l.note || "") + " " + String(l.amount) + " " + (l.date || "")).toLowerCase().includes(t)) return false;
-      return true;
-    });
-  }, [lines, filter, q, holder]);
+  const active = (lines || []).find(l => l.id === activeId) || null;
+  const pages = statement.pages || [];
 
-  function attach(line) {
-    if (!fs) { toast("Upload isn't available — the Filestack script didn't load.", "err"); return; }
-    setBusyId(line.id);
-    fs.picker({
-      accept: ["application/pdf", "image/*", ".heic", ".doc", ".docx", ".xls", ".xlsx", ".eml", ".msg"],
-      maxFiles: 10,
-      fromSources: ["local_file_system", "googledrive", "dropbox", "onedrive", "url"],
-      storeTo: { path: (statement.filestackFolder || (CFG.filestackBasePath + statement.id + "/")) + line.id + "/" },
-      onUploadDone: async r => {
-        setBusyId(null);
-        const files = (r.filesUploaded || []).map(f => ({
-          url: f.url, handle: f.handle, name: f.filename, size: f.size, mimetype: f.mimetype,
-          uploadedBy: session.name, uploadedAt: Date.now()
-        }));
-        if (!files.length) return;
-        try {
-          await svc.updateLine(statement.id, line.id, { attachments: [...(line.attachments || []), ...files] }, session, lines);
-          toast(files.length + (files.length > 1 ? " files attached" : " file attached") + " to " + line.desc, "ok");
-        } catch (e) { toast("Couldn't save the attachment: " + e.message, "err"); }
-      },
-      onFileUploadFailed: (f, e) => { setBusyId(null); toast("Upload failed: " + ((e && e.message) || "unknown error"), "err"); },
-      onClose: () => setBusyId(null)
-    }).open();
-  }
-
-  async function removeAttachment(line, idx) {
-    if (!confirm("Remove this attachment from the line? (The file stays in Filestack.)")) return;
-    const atts = (line.attachments || []).filter((_, i) => i !== idx);
-    try { await svc.updateLine(statement.id, line.id, { attachments: atts }, session, lines); } catch (e) { toast(e.message, "err"); }
-  }
-  async function toggleNoReceipt(line) {
-    const v = !line.noReceipt;
-    let reason = line.noReceiptReason || "";
-    if (v) { reason = prompt("Why is no receipt needed? (optional)", reason || "") ; if (reason === null) return; }
-    try { await svc.updateLine(statement.id, line.id, { noReceipt: v, noReceiptReason: v ? reason : "" }, session, lines); } catch (e) { toast(e.message, "err"); }
-  }
-  async function saveNote(line) {
-    const v = noteDraft[line.id];
-    if (v === undefined || v === (line.note || "")) return;
-    try { await svc.updateLine(statement.id, line.id, { note: v }, session, lines); toast("Note saved", "ok"); } catch (e) { toast(e.message, "err"); }
-  }
-  async function deleteLine(line) {
-    if (!confirm("Delete this line from the statement?")) return;
-    try { await svc.deleteLine(statement.id, line.id, lines); } catch (e) { toast(e.message, "err"); }
-  }
-  async function addManual() {
-    if (!newLine.desc) return;
+  // Click on an unmarked row: create the line, open the picker right away,
+  // and read the strip in the background for a label.
+  async function markRow(page, band) {
+    const line = { id: uid(), page: page.n, y0: band[0], y1: band[1] };
     try {
-      await svc.addLine(statement.id, { seq: (lines ? lines.length : 0) + 1, date: newLine.date, desc: newLine.desc,
-        amount: newLine.amount === "" ? null : parseFloat(newLine.amount), extra: [], cardholder: holder || statement.primaryName || "", page: null, manual: true }, session, lines);
-      setNewLine({ date: "", desc: "", amount: "" }); setAdding(false);
-    } catch (e) { toast(e.message, "err"); }
+      await svc.addLine(statement.id, line, session, lines);
+    } catch (e) { toast(explainError(e, "Marking the line"), "err"); return; }
+    setActiveId(line.id);
+    if (fs) openPicker(fs, statement, line, session, lines, toast, null);
+    if (CFG.labelOcr) {
+      setReading(r => ({ ...r, [line.id]: true }));
+      const lbl = await readBand(page.url, band);
+      setReading(r => { const c = { ...r }; delete c[line.id]; return c; });
+      if (lbl && (lbl.desc || lbl.amount !== null)) {
+        const current = (lines || []).find(l => l.id === line.id);
+        if (!current || (!current.desc && (current.amount === null || current.amount === undefined)))
+          svc.updateLine(statement.id, line.id, { desc: lbl.desc, amount: lbl.amount, date: lbl.date }, session, null).catch(() => {});
+      }
+    }
   }
+
+  function centerLine(l, behavior) {
+    const el = pageRefs.current[l.page];
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    window.scrollTo({ top: window.scrollY + r.top + r.height * l.y0 - window.innerHeight / 2, behavior: behavior || "smooth" });
+  }
+  function scrollToLine(l) { setActiveId(l.id); }
+  // Opening the side panel narrows the page column, which moves everything;
+  // re-centre the active line after the layout has settled.
+  const lastActive = useRef(null);
+  useEffect(() => {
+    const target = active || lastActive.current;   // closing: keep the line you were on in view
+    if (active) lastActive.current = active;
+    if (!target) return;
+    const t = setTimeout(() => centerLine(target, "auto"), 30);
+    return () => clearTimeout(t);
+  }, [activeId]);
 
   function exportCsv() {
-    const rows = [["#", "Date", "Description", "Details", "Cardholder", "Amount", "Status", "Note", "No-receipt reason", "Attachments", "Attachment URLs"]];
-    (lines || []).forEach((l, i) => rows.push([i + 1, l.date, l.desc, (l.extra || []).join(" | "), l.cardholder, l.amount,
+    const rows = [["#", "Page", "Date", "Label", "Amount", "Status", "Note", "No-receipt reason", "Attachments", "Attachment URLs", "Marked by"]];
+    (lines || []).forEach((l, i) => rows.push([i + 1, l.page, l.date, l.desc, l.amount,
       { done: "Attached", skip: "No receipt needed", todo: "Missing" }[lineStatus(l)], l.note, l.noReceiptReason,
-      (l.attachments || []).map(a => a.name).join(" | "), (l.attachments || []).map(a => a.url).join(" | ")]));
+      (l.attachments || []).map(a => a.name).join(" | "), (l.attachments || []).map(a => a.url).join(" | "), l.createdBy && l.createdBy.name]));
     const csv = rows.map(r => r.map(csvEscape).join(",")).join("\n");
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
@@ -1109,153 +1082,85 @@ function StatementView({ statement, session, fs, onBack, toast }) {
     a.click();
   }
 
-  const open = stats.todo;
+  const listed = (lines || []).filter(l => filter === "all" || lineStatus(l) === filter);
+
   return (
     <div onMouseLeave={() => setHover(null)}>
       <HoverCard hover={hover} />
-      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <button onClick={onBack} className="text-sm text-[#2a5f9e] hover:underline">← All statements</button>
-          <h2 className="text-xl font-semibold text-slate-900">{statement.title}</h2>
-          <div className="text-xs text-slate-500">
-            {statement.cardName}{statement.accountEnding ? " · ending " + statement.accountEnding : ""}
-            {statement.closingDate ? " · closes " + statement.closingDate : ""}
-            {statement.pdf && <a href={statement.pdf.url} target="_blank" rel="noopener" className="ml-2 text-[#2a5f9e] hover:underline">Open original PDF ↗</a>}
+      {active && <LinePanel statement={statement} line={{ ...active, reading: !!reading[active.id] }} lines={lines} session={session} fs={fs}
+                            onClose={() => setActiveId(null)} toast={toast} />}
+
+      <div className="sticky top-0 z-20 -mx-4 mb-3 border-b bg-slate-100/95 px-4 py-2 backdrop-blur">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <button onClick={onBack} className="text-sm text-[#2a5f9e] hover:underline">← Statements</button>
+          <div className="min-w-0 flex-1">
+            <div className="truncate font-semibold text-slate-900">{statement.title}</div>
+            <div className="text-[11px] text-slate-500">
+              {stats.todo === 0 && lines && lines.length ? "All marked lines have a receipt" : stats.todo + " waiting for a receipt"} · {stats.done} attached · {stats.skip} no receipt · {(lines || []).length} marked
+              {statement.pdf && <a href={statement.pdf.url} target="_blank" rel="noopener" className="ml-2 text-[#2a5f9e] hover:underline">Original PDF ↗</a>}
+            </div>
           </div>
+          <div className="flex items-center gap-1 text-xs">
+            <span className="text-slate-500">Zoom</span>
+            {[70, 100, 130, 160].map(z => (
+              <button key={z} onClick={() => setZoom(z)} className={"rounded-md border px-2 py-1 " + (zoom === z ? "border-[#2a5f9e] bg-[#eaf1fb] text-[#2a5f9e]" : "bg-white text-slate-600")}>{z}%</button>
+            ))}
+          </div>
+          <button onClick={() => setShowList(s => !s)} className="rounded-lg border bg-white px-3 py-1.5 text-xs text-slate-700">{showList ? "Hide list" : "Show list"}</button>
+          <button onClick={exportCsv} className="rounded-lg border bg-white px-3 py-1.5 text-xs text-slate-700">Export CSV</button>
         </div>
-        <div className="flex gap-2">
-          <button onClick={exportCsv} className="rounded-lg border bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50">Export CSV</button>
-        </div>
+        <div className="mt-2"><Progress done={stats.done} skip={stats.skip} total={(lines || []).length} small /></div>
       </div>
 
-      <div className="mb-3 rounded-xl border bg-white p-4">
-        <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
-          <div>
-            <span className="text-2xl font-semibold text-slate-900">{open === 0 ? "All done" : open + " to go"}</span>
-            <span className="ml-3 text-slate-500">{stats.done} attached · {stats.skip} no receipt needed · {(lines || []).length} lines · {money(stats.total)}</span>
-          </div>
-          <div className="text-xs text-slate-400">Hover a line to preview its receipts · click to attach or edit</div>
+      <div className={"flex gap-4 " + (active ? "pr-[28rem]" : "")}>
+        <div className="min-w-0 flex-1 space-y-6 overflow-x-auto">
+          {lines === null && <div className="rounded-xl border bg-white p-8 text-center text-sm text-slate-500"><Spinner /> Loading…</div>}
+          {lines !== null && !lines.length && (
+            <div className="rounded-xl border border-[#2a5f9e]/30 bg-[#eaf1fb] p-3 text-sm text-slate-700">
+              Move the mouse over a line on the statement — it highlights across the full width. Click it to mark it and attach the receipt.
+            </div>
+          )}
+          {lines !== null && pages.map(p => (
+            <div key={p.n} ref={el => { pageRefs.current[p.n] = el; }}>
+              <StatementPage page={p} lines={lines} zoom={zoom} activeId={activeId}
+                             onHoverLine={(l, e) => setHover({ line: l, x: e.clientX, y: e.clientY })}
+                             onLeaveLine={() => setHover(null)}
+                             onClickLine={l => { setHover(null); setActiveId(l.id); }}
+                             onClickEmpty={markRow} />
+            </div>
+          ))}
         </div>
-        <div className="mt-2"><Progress done={stats.done} skip={stats.skip} total={(lines || []).length} /></div>
-      </div>
 
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        {[["all", "All"], ["todo", "Needs receipt"], ["done", "Attached"], ["skip", "No receipt needed"]].map(([k, label]) => (
-          <button key={k} onClick={() => setFilter(k)}
-                  className={"rounded-full border px-3 py-1 text-xs font-medium " + (filter === k ? "border-[#2a5f9e] bg-[#eaf1fb] text-[#2a5f9e]" : "bg-white text-slate-600")}>
-            {label} <span className="text-slate-400">{k === "all" ? (lines || []).length : stats[k]}</span>
-          </button>
-        ))}
-        {holders.length > 1 && (
-          <select value={holder} onChange={e => setHolder(e.target.value)} className="rounded-full border bg-white px-3 py-1 text-xs">
-            <option value="">All cardholders</option>
-            {holders.map(h => <option key={h} value={h}>{h}</option>)}
-          </select>
+        {showList && !active && lines !== null && (
+          <aside className="hidden w-72 shrink-0 lg:block">
+            <div className="sticky top-24 rounded-xl border bg-white">
+              <div className="flex flex-wrap gap-1 border-b p-2">
+                {[["all", "All"], ["todo", "Waiting"], ["done", "Attached"], ["skip", "No receipt"]].map(([k, label]) => (
+                  <button key={k} onClick={() => setFilter(k)} className={"rounded-full border px-2 py-0.5 text-[11px] font-medium " + (filter === k ? "border-[#2a5f9e] bg-[#eaf1fb] text-[#2a5f9e]" : "bg-white text-slate-600")}>
+                    {label} <span className="text-slate-400">{k === "all" ? (lines || []).length : stats[k]}</span>
+                  </button>
+                ))}
+              </div>
+              <div className="max-h-[70vh] overflow-y-auto">
+                {!listed.length && <div className="p-4 text-center text-xs text-slate-400">Nothing here yet.</div>}
+                {listed.map(l => {
+                  const st = lineStatus(l);
+                  return (
+                    <button key={l.id} onClick={() => scrollToLine(l)}
+                            className={"flex w-full items-center gap-2 border-b px-3 py-2 text-left text-xs hover:bg-slate-50 " + (activeId === l.id ? "bg-[#eaf1fb]" : "")}>
+                      <span className={"h-2 w-2 shrink-0 rounded-full " + (st === "done" ? "bg-emerald-500" : st === "skip" ? "bg-slate-400" : "bg-amber-500")} />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate font-medium text-slate-800">{l.desc || (reading[l.id] ? "Reading…" : "Page " + l.page + " line")}</span>
+                        <span className="block text-[10px] text-slate-400">p.{l.page}{l.date ? " · " + l.date : ""}{(l.attachments || []).length ? " · 📎 " + l.attachments.length : ""}</span>
+                      </span>
+                      {l.amount !== null && l.amount !== undefined && <span className="shrink-0 font-semibold text-slate-700">{money(l.amount)}</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </aside>
         )}
-        <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search merchant, amount, note…"
-               className="ml-auto w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm sm:w-64" />
-      </div>
-
-      <div className="overflow-x-auto rounded-xl border bg-white">
-        <table className="w-full text-sm">
-          <thead className="bg-slate-50 text-left text-[11px] uppercase tracking-wider text-slate-500">
-            <tr><th className="px-3 py-2">Date</th><th className="px-3 py-2">Description</th>
-                {holders.length > 1 && <th className="px-3 py-2">Cardholder</th>}
-                <th className="px-3 py-2 text-right">Amount</th><th className="px-3 py-2">Status</th><th className="px-3 py-2">Receipts</th><th className="px-3 py-2"></th></tr>
-          </thead>
-          <tbody>
-            {lines === null && <tr><td colSpan="7" className="p-6 text-center text-slate-500"><Spinner /> Loading lines…</td></tr>}
-            {lines !== null && !shown.length && <tr><td colSpan="7" className="p-6 text-center text-slate-500">Nothing matches.</td></tr>}
-            {shown.map(l => {
-              const st = lineStatus(l), isOpen = openId === l.id, atts = l.attachments || [];
-              return (
-                <React.Fragment key={l.id}>
-                  <tr className={"cursor-pointer border-t " + (st === "done" ? "row-done" : st === "skip" ? "row-skip" : "") + (isOpen ? " !bg-[#eaf1fb]" : "")}
-                      onMouseEnter={e => !isOpen && setHover({ line: l, x: e.clientX, y: e.clientY })}
-                      onMouseMove={e => !isOpen && setHover(h => h && h.line.id === l.id ? { line: l, x: e.clientX, y: e.clientY } : h)}
-                      onMouseLeave={() => setHover(null)}
-                      onClick={() => { setOpenId(isOpen ? null : l.id); setHover(null); }}>
-                    <td className="whitespace-nowrap px-3 py-2 text-slate-600">{l.date}</td>
-                    <td className="px-3 py-2">
-                      <div className="font-medium text-slate-900">{l.desc}</div>
-                      {l.extra && l.extra.length > 0 && <div className="text-[11px] text-slate-400">{l.extra.join(" · ")}</div>}
-                      {l.note && <div className="text-[11px] text-amber-800">📝 {l.note}</div>}
-                    </td>
-                    {holders.length > 1 && <td className="px-3 py-2 text-xs text-slate-600">{l.cardholder}</td>}
-                    <td className="whitespace-nowrap px-3 py-2 text-right font-medium">{money(l.amount)}</td>
-                    <td className="px-3 py-2"><Chip status={st} /></td>
-                    <td className="px-3 py-2">
-                      {atts.length > 0 && (
-                        <div className="flex gap-1">
-                          {atts.slice(0, 3).map((a, i) => <img key={i} src={thumbUrl(a, 80)} className="h-8 w-8 rounded border object-cover" alt="" onError={e => { e.target.style.display = "none"; }} />)}
-                          {atts.length > 3 && <span className="text-xs text-slate-500">+{atts.length - 3}</span>}
-                        </div>
-                      )}
-                    </td>
-                    <td className="whitespace-nowrap px-3 py-2 text-right">
-                      <button onClick={e => { e.stopPropagation(); attach(l); }} disabled={busyId === l.id}
-                              className={"rounded-lg px-3 py-1 text-xs font-medium " + (st === "todo" ? "bg-[#2a5f9e] text-white hover:bg-[#234f84]" : "border bg-white text-slate-700 hover:bg-slate-50")}>
-                        {busyId === l.id ? "…" : atts.length ? "+ Add" : "Attach"}
-                      </button>
-                    </td>
-                  </tr>
-                  {isOpen && (
-                    <tr className="border-t bg-[#f7faff]">
-                      <td colSpan="7" className="px-4 py-3">
-                        <div className="grid gap-4 lg:grid-cols-[1fr_320px]">
-                          <div>
-                            {l.snip && <img src={l.snip} className="snip mb-3 w-full max-w-3xl" alt="" />}
-                            <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">Receipts ({atts.length})</div>
-                            {!atts.length && <div className="text-sm text-slate-500">None yet.</div>}
-                            <div className="flex flex-wrap gap-3">
-                              {atts.map((a, i) => (
-                                <div key={i} className="relative">
-                                  <AttachmentThumb att={a} size="lg" />
-                                  <div className="text-[10px] text-slate-400">{fmtBytes(a.size)}{a.uploadedBy ? " · " + a.uploadedBy : ""}</div>
-                                  <button onClick={e => { e.stopPropagation(); removeAttachment(l, i); }}
-                                          className="absolute -right-1 -top-1 h-5 w-5 rounded-full bg-white text-xs text-red-500 shadow hover:bg-red-50" title="Remove">✕</button>
-                                </div>
-                              ))}
-                            </div>
-                            <div className="mt-3 flex flex-wrap gap-2">
-                              <button onClick={e => { e.stopPropagation(); attach(l); }} className="rounded-lg bg-[#2a5f9e] px-3 py-1.5 text-xs font-medium text-white">Attach receipt{atts.length ? "s" : ""}</button>
-                              <button onClick={e => { e.stopPropagation(); toggleNoReceipt(l); }} className="rounded-lg border bg-white px-3 py-1.5 text-xs text-slate-700">
-                                {l.noReceipt ? "Receipt is needed after all" : "No receipt needed"}
-                              </button>
-                              {statement.pdf && l.page && <a href={statement.pdf.url + "#page=" + l.page} target="_blank" rel="noopener" onClick={e => e.stopPropagation()}
-                                  className="rounded-lg border bg-white px-3 py-1.5 text-xs text-slate-700">Statement page {l.page} ↗</a>}
-                              {isManager(session) && <button onClick={e => { e.stopPropagation(); deleteLine(l); }} className="ml-auto text-xs text-red-500 hover:underline">Delete line</button>}
-                            </div>
-                          </div>
-                          <div onClick={e => e.stopPropagation()}>
-                            <div className="mb-1 text-xs font-semibold uppercase tracking-wider text-slate-500">Note</div>
-                            <textarea value={noteDraft[l.id] !== undefined ? noteDraft[l.id] : (l.note || "")}
-                                      onChange={e => setNoteDraft(d => ({ ...d, [l.id]: e.target.value }))}
-                                      onBlur={() => saveNote(l)} rows="3" placeholder="Store #, purpose, who it was for…"
-                                      className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm" />
-                            {l.noReceipt && <div className="mt-2 text-xs text-slate-500">No receipt needed{l.noReceiptReason ? ": " + l.noReceiptReason : ""}</div>}
-                            {l.updatedBy && <div className="mt-2 text-[11px] text-slate-400">Last updated by {l.updatedBy.name} · {fmtDate(l.updatedAt)}</div>}
-                          </div>
-                        </div>
-                      </td>
-                    </tr>
-                  )}
-                </React.Fragment>
-              );
-            })}
-          </tbody>
-        </table>
-        <div className="border-t p-3">
-          {!adding
-            ? <button onClick={() => setAdding(true)} className="text-sm text-[#2a5f9e] hover:underline">+ Add a line that's missing</button>
-            : <div className="flex flex-wrap items-center gap-2">
-                <input value={newLine.date} onChange={e => setNewLine(n => ({ ...n, date: e.target.value }))} placeholder="MM/DD/YY" className="w-24 rounded border px-2 py-1 text-sm" />
-                <input value={newLine.desc} onChange={e => setNewLine(n => ({ ...n, desc: e.target.value }))} placeholder="Description" className="w-64 rounded border px-2 py-1 text-sm" />
-                <input type="number" step="0.01" value={newLine.amount} onChange={e => setNewLine(n => ({ ...n, amount: e.target.value }))} placeholder="Amount" className="w-28 rounded border px-2 py-1 text-sm" />
-                <button onClick={addManual} className="rounded-lg bg-[#2a5f9e] px-3 py-1 text-xs font-medium text-white">Add</button>
-                <button onClick={() => setAdding(false)} className="text-xs text-slate-500">Cancel</button>
-              </div>}
-        </div>
       </div>
     </div>
   );
@@ -1274,16 +1179,16 @@ function App() {
   const [view, setView] = useState({ name: "list" });
   const [statements, setStatements] = useState([]);
   const [loadingStmts, setLoadingStmts] = useState(true);
+  const [permError, setPermError] = useState(false);
 
-  // Directory load, then restore a saved session against the LIVE directory.
   useEffect(() => {
     directoryService.load().then(d => {
       setDir(d);
       try {
-        const saved = JSON.parse(localStorage.getItem("cc_session") || "null");
+        const saved = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
         if (saved) {
           const s = resolveSession(saved.email, saved.pw, d);
-          if (!s.error) setSession(s); else localStorage.removeItem("cc_session");
+          if (!s.error) setSession(s); else localStorage.removeItem(SESSION_KEY);
         }
       } catch (e) {}
     }).catch(e => setDirError("Couldn't load the directory: " + e.message));
@@ -1293,35 +1198,34 @@ function App() {
     if (!fbReady || !session) return;
     setLoadingStmts(true);
     const un = svc.subscribeStatements(xs => { setStatements(xs); setLoadingStmts(false); },
-                                       e => { setLoadingStmts(false); showToast("Firestore: " + e.message, "err"); });
+      e => { setLoadingStmts(false); if (isPermissionError(e)) setPermError(true); else showToast("Firestore: " + e.message, "err"); });
     return un;
   }, [fbReady, session]);
 
   function signIn(sess, creds) {
     setSession(sess);
-    try { localStorage.setItem("cc_session", JSON.stringify(creds)); } catch (e) {}
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify(creds)); } catch (e) {}
   }
   function signOut() {
     setSession(null); setView({ name: "list" });
-    try { localStorage.removeItem("cc_session"); } catch (e) {}
+    try { localStorage.removeItem(SESSION_KEY); } catch (e) {}
   }
   async function deleteStatement(s) {
-    if (!confirm("Delete “" + s.title + "” and all its lines? Receipts already uploaded stay in Filestack.")) return;
-    try { await svc.deleteStatement(s.id); showToast("Statement deleted", "ok"); } catch (e) { showToast(e.message, "err"); }
+    if (!confirm("Delete “" + s.title + "” and all its marked lines? Files already uploaded stay in Filestack.")) return;
+    try { await svc.deleteStatement(s.id); showToast("Statement deleted", "ok"); } catch (e) { showToast(explainError(e, "Delete"), "err"); }
   }
 
   if (!session) return <div><Login dir={dir} dirError={dirError} onSignIn={signIn} /><Toast toast={toast} /></div>;
-
   const current = view.name === "statement" ? statements.find(s => s.id === view.id) : null;
 
   return (
-    <div className="mx-auto max-w-7xl p-4">
-      <header className="mb-5 flex flex-wrap items-center justify-between gap-3">
+    <div className="mx-auto max-w-[1600px] p-4">
+      <header className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-[#2a5f9e] text-lg text-white">🧾</div>
           <div>
             <div className="text-[10px] font-bold uppercase tracking-widest text-[#8c909a]">DPM</div>
-            <div className="-mt-0.5 font-semibold text-slate-900">ReceiptMi</div>
+            <div className="-mt-0.5 font-semibold text-slate-900">StateMi <span className="ml-1 text-xs font-normal text-slate-400">statement visualizer</span></div>
           </div>
         </div>
         <div className="flex items-center gap-3 text-sm">
@@ -1330,19 +1234,20 @@ function App() {
         </div>
       </header>
 
+      {permError && <PermissionBanner />}
       {view.name === "list" && (
         <StatementList statements={statements} loading={loadingStmts} session={session}
                        onOpen={s => setView({ name: "statement", id: s.id })} onNew={() => setView({ name: "new" })} onDelete={deleteStatement} />
       )}
       {view.name === "new" && (
-        <NewStatement session={session} fs={fs} toast={showToast}
+        <NewStatement session={session} fs={fs} toast={showToast} onPermError={() => setPermError(true)}
                       onDone={id => setView({ name: "statement", id })} onCancel={() => setView({ name: "list" })} />
       )}
       {view.name === "statement" && (current
         ? <StatementView statement={current} session={session} fs={fs} toast={showToast} onBack={() => setView({ name: "list" })} />
         : <div className="rounded-xl border bg-white p-8 text-center text-sm text-slate-500">{loadingStmts ? <Spinner /> : "That statement is no longer available."}</div>)}
 
-      <footer className="mt-8 text-center text-[11px] text-slate-400">ReceiptMi v{CFG.version} · OCR runs in your browser · files stored in Filestack · data in Firestore</footer>
+      <footer className="mt-8 text-center text-[11px] text-slate-400">StateMi v{CFG.version} · pages prepared in your browser · files in Filestack · data in Firestore</footer>
       <Toast toast={toast} />
     </div>
   );
