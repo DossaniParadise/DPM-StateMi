@@ -823,48 +823,94 @@ function NewStatement({ session, fs, onDone, onCancel, toast, onPermError }) {
 /* ============================================================
    9. STATEMENT VIEWER — pages, bands, hover card, side panel
    ============================================================ */
-// Large preview of a line's documents. Opens on hover, stays open while the
-// mouse is inside it (so it can be scrolled), and can be pinned by clicking.
-function BigPreview({ line, pinned, onEnter, onLeave, onClose }) {
+// --- Preview helpers shared by the in-page window and the pop-out window ---
+function attKind(a) {
+  if (!a) return "none";
+  if (/^image\//.test(a.mimetype || "") || /\.(png|jpe?g|gif|webp|heic)$/i.test(a.name || "")) return "image";
+  if (/pdf/i.test(a.mimetype || "") || /\.pdf$/i.test(a.name || "")) return "pdf";
+  return "doc";
+}
+function attSrc(a) {
+  const k = attKind(a);
+  return k === "pdf" ? a.url + "#view=FitH" : k === "doc" ? "https://cdn.filestackcontent.com/preview/" + a.handle : a.url;
+}
+const PREVIEW_BOX_KEY = "statemi_preview_box";
+function defaultBox() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const w = Math.min(760, vw - 32), h = Math.min(640, vh - 96);
+  return { x: Math.max(8, vw - w - 16), y: 80, w, h };
+}
+function loadBox() {
+  try {
+    const b = JSON.parse(localStorage.getItem(PREVIEW_BOX_KEY) || "null");
+    if (b && b.w > 240 && b.h > 160) {
+      // keep it on screen
+      b.x = Math.min(Math.max(0, b.x), window.innerWidth - 120);
+      b.y = Math.min(Math.max(0, b.y), window.innerHeight - 60);
+      return b;
+    }
+  } catch (e) {}
+  return defaultBox();
+}
+
+// Floating, draggable, resizable preview window. Opens on hover, stays open
+// while the mouse is inside it (so it can be scrolled), pinned by clicking.
+function PreviewWindow({ line, pinned, onEnter, onLeave, onClose, onPopOut }) {
   const atts = line.attachments || [];
   const [idx, setIdx] = useState(0);
+  const [box, setBox] = useState(loadBox);
+  const drag = useRef(null);
   useEffect(() => { setIdx(0); }, [line.id]);
   useEffect(() => {
     const h = e => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", h); return () => window.removeEventListener("keydown", h);
   }, []);
+  useEffect(() => { try { localStorage.setItem(PREVIEW_BOX_KEY, JSON.stringify(box)); } catch (e) {} }, [box]);
+
+  // Drag (title bar) and resize (corner) with pointer events on the window.
+  function startDrag(mode, e) {
+    e.preventDefault();
+    drag.current = { mode, sx: e.clientX, sy: e.clientY, box: { ...box } };
+    const move = ev => {
+      const d = drag.current; if (!d) return;
+      const dx = ev.clientX - d.sx, dy = ev.clientY - d.sy;
+      if (d.mode === "move") setBox(b => ({ ...b, x: Math.min(window.innerWidth - 80, Math.max(-b.w + 80, d.box.x + dx)), y: Math.min(window.innerHeight - 40, Math.max(0, d.box.y + dy)) }));
+      else setBox(b => ({ ...b, w: Math.max(280, d.box.w + dx), h: Math.max(180, d.box.h + dy) }));
+    };
+    const up = () => { drag.current = null; window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
+    window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
+  }
+  const maximize = () => setBox(b => (b.w >= window.innerWidth - 40 && b.h >= window.innerHeight - 90) ? defaultBox()
+                                      : { x: 16, y: 76, w: window.innerWidth - 32, h: window.innerHeight - 92 });
+
   const att = atts[Math.min(idx, atts.length - 1)];
-  const kind = a => {
-    if (!a) return "none";
-    if (/^image\//.test(a.mimetype || "") || /\.(png|jpe?g|gif|webp|heic)$/i.test(a.name || "")) return "image";
-    if (/pdf/i.test(a.mimetype || "") || /\.pdf$/i.test(a.name || "")) return "pdf";
-    return "doc";
-  };
-  const k = kind(att);
+  const k = attKind(att);
   const st = lineStatus(line);
   return (
-    <div className="fixed z-40 flex flex-col overflow-hidden rounded-xl border bg-white shadow-2xl"
-         style={{ left: "max(300px, 22vw)", right: 12, top: 76, bottom: 12 }}
+    <div className="fixed z-40 flex flex-col overflow-hidden rounded-xl border border-slate-300 bg-white shadow-2xl"
+         style={{ left: box.x, top: box.y, width: box.w, height: box.h }}
          onMouseEnter={onEnter} onMouseLeave={onLeave} onClick={e => e.stopPropagation()}>
-      <div className="flex items-center gap-3 border-b bg-slate-50 px-4 py-2">
+      <div className="flex cursor-move select-none items-center gap-2 border-b bg-slate-100 px-3 py-1.5" onMouseDown={e => { if (!e.target.closest("button")) startDrag("move", e); }}
+           onDoubleClick={maximize} title="Drag to move · double-click to maximize">
+        <Chip status={st} />
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <Chip status={st} />
-            <span className="truncate text-sm font-semibold text-slate-900">{line.desc || "Marked line"}</span>
-            {line.date && <span className="text-xs text-slate-400">{line.date}</span>}
-            {line.amount !== null && line.amount !== undefined && <span className="text-sm font-semibold text-slate-800">{money(line.amount)}</span>}
-            <span className="text-xs text-slate-400">· page {line.page}</span>
+          <div className="truncate text-sm font-semibold text-slate-900">
+            {line.desc || "Marked line"}
+            {line.amount !== null && line.amount !== undefined && <span className="ml-2 font-semibold text-slate-700">{money(line.amount)}</span>}
+            <span className="ml-2 text-xs font-normal text-slate-400">{line.date ? line.date + " · " : ""}page {line.page}</span>
           </div>
-          {line.note && <div className="mt-0.5 truncate text-xs text-amber-900">📝 {line.note}</div>}
+          {line.note && <div className="truncate text-[11px] text-amber-900">📝 {line.note}</div>}
         </div>
-        <span className="hidden text-[11px] text-slate-400 md:inline">{pinned ? "Pinned — Esc or ✕ to close" : "Move the mouse in here to scroll · click the line to pin"}</span>
-        <button onClick={onClose} className="rounded-lg px-2 py-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700" title="Close">✕</button>
+        <span className="hidden text-[10px] text-slate-400 xl:inline">{pinned ? "Pinned" : "Click the line to pin"}</span>
+        {onPopOut && <button onClick={onPopOut} className="rounded-md border bg-white px-2 py-0.5 text-[11px] text-slate-700 hover:bg-slate-50" title="Open in a separate browser window (drag it to another monitor)">Pop out ↗</button>}
+        <button onClick={maximize} className="rounded-md px-1.5 py-0.5 text-slate-500 hover:bg-slate-200" title="Maximize / restore">▢</button>
+        <button onClick={onClose} className="rounded-md px-1.5 py-0.5 text-slate-500 hover:bg-slate-200" title="Close (Esc)">✕</button>
       </div>
       {atts.length > 1 && (
-        <div className="flex gap-1 overflow-x-auto border-b px-3 py-1.5">
+        <div className="flex gap-1 overflow-x-auto border-b px-2 py-1">
           {atts.map((a, i) => (
             <button key={i} onClick={() => setIdx(i)}
-                    className={"whitespace-nowrap rounded-full border px-3 py-1 text-xs " + (i === idx ? "border-[#2a5f9e] bg-[#eaf1fb] text-[#2a5f9e]" : "bg-white text-slate-600")}>
+                    className={"whitespace-nowrap rounded-full border px-2.5 py-0.5 text-[11px] " + (i === idx ? "border-[#2a5f9e] bg-[#eaf1fb] text-[#2a5f9e]" : "bg-white text-slate-600")}>
               {i + 1}. {a.name}
             </button>
           ))}
@@ -872,22 +918,64 @@ function BigPreview({ line, pinned, onEnter, onLeave, onClose }) {
       )}
       <div className="min-h-0 flex-1 overflow-auto bg-slate-200">
         {k === "none" && (
-          <div className="flex h-full items-center justify-center p-8 text-center text-sm text-slate-500">
+          <div className="flex h-full items-center justify-center p-6 text-center text-sm text-slate-500">
             {line.noReceipt ? <span>No receipt needed{line.noReceiptReason ? " — " + line.noReceiptReason : ""}.</span> : <span>Nothing attached to this line yet.</span>}
           </div>
         )}
         {k === "image" && <img src={att.url} alt={att.name} className="block w-full" />}
-        {k === "pdf" && <iframe src={att.url + "#view=FitH"} title={att.name} className="h-full w-full bg-white" />}
-        {k === "doc" && <iframe src={"https://cdn.filestackcontent.com/preview/" + att.handle} title={att.name} className="h-full w-full bg-white" />}
+        {(k === "pdf" || k === "doc") && <iframe src={attSrc(att)} title={att.name} className="h-full w-full bg-white" />}
       </div>
       {att && (
-        <div className="flex items-center justify-between border-t px-4 py-1.5 text-xs text-slate-500">
+        <div className="flex items-center justify-between border-t px-3 py-1 text-[11px] text-slate-500">
           <span className="truncate">{att.name}{att.size ? " · " + fmtBytes(att.size) : ""}{att.uploadedBy ? " · " + att.uploadedBy : ""}</span>
           <a href={att.url} target="_blank" rel="noopener" className="ml-3 shrink-0 text-[#2a5f9e] hover:underline">Open in new tab ↗</a>
         </div>
       )}
+      <div onMouseDown={e => startDrag("resize", e)} className="absolute bottom-0 right-0 h-4 w-4 cursor-nwse-resize" title="Drag to resize"
+           style={{ background: "linear-gradient(135deg, transparent 50%, #94a3b8 50%, #94a3b8 60%, transparent 60%, transparent 75%, #94a3b8 75%)" }} />
     </div>
   );
+}
+
+// --- Pop-out: a real browser window that follows whatever line is hovered ---
+function openPopout() {
+  const w = window.open("", "statemi_preview", "popup=yes,width=900,height=1000,left=" + Math.max(0, window.screenX + window.outerWidth - 920) + ",top=" + Math.max(0, window.screenY + 40));
+  if (!w) return null;
+  try { w.document.title = "StateMi preview"; } catch (e) {}
+  return w;
+}
+function renderPopout(w, line) {
+  if (!w || w.closed) return;
+  const esc = s => String(s || "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const atts = line ? (line.attachments || []) : [];
+  const st = line ? lineStatus(line) : "todo";
+  const title = line ? (line.desc || "Marked line") : "StateMi preview";
+  const frames = atts.map((a, i) => {
+    const k = attKind(a);
+    const body = k === "image" ? '<img src="' + esc(a.url) + '" alt="">' : '<iframe src="' + esc(attSrc(a)) + '"></iframe>';
+    return '<div class="doc" id="doc' + i + '" style="display:' + (i === 0 ? "flex" : "none") + '">' + body + '</div>';
+  }).join("");
+  const tabs = atts.length > 1 ? '<div class="tabs">' + atts.map((a, i) => '<button class="tab' + (i === 0 ? " on" : "") + '" onclick="show(' + i + ')">' + (i + 1) + ". " + esc(a.name) + "</button>").join("") + "</div>" : "";
+  const empty = !line ? '<div class="empty">Hover a highlighted line on the statement — it will show here.</div>'
+              : !atts.length ? '<div class="empty">' + (line.noReceipt ? "No receipt needed" + (line.noReceiptReason ? " — " + esc(line.noReceiptReason) : "") + "." : "Nothing attached to this line yet.") + "</div>" : "";
+  const html = '<!doctype html><html><head><meta charset="utf-8"><title>StateMi preview</title><style>' +
+    "html,body{margin:0;height:100%;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#e2e8f0;color:#0f172a}" +
+    "body{display:flex;flex-direction:column}.hd{display:flex;align-items:center;gap:10px;padding:8px 12px;background:#f1f5f9;border-bottom:1px solid #cbd5e1;font-size:14px}" +
+    ".chip{font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;border:1px solid}.done{background:#d1fae5;color:#065f46;border-color:#a7f3d0}.todo{background:#fef3c7;color:#92400e;border-color:#fde68a}.skip{background:#e2e8f0;color:#475569;border-color:#cbd5e1}" +
+    ".t{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}.m{color:#64748b;font-size:12px;white-space:nowrap}.note{font-size:12px;color:#78350f;padding:0 12px 6px;background:#f1f5f9}" +
+    ".tabs{display:flex;gap:4px;padding:6px 8px;background:#fff;border-bottom:1px solid #e2e8f0;overflow-x:auto}.tab{font:inherit;font-size:12px;padding:3px 10px;border-radius:999px;border:1px solid #cbd5e1;background:#fff;cursor:pointer;white-space:nowrap}.tab.on{border-color:#2a5f9e;background:#eaf1fb;color:#2a5f9e}" +
+    ".wrap{flex:1;min-height:0;position:relative}.doc{position:absolute;inset:0;overflow:auto;display:flex;flex-direction:column}.doc img{display:block;width:100%}.doc iframe{flex:1;width:100%;border:0;background:#fff}" +
+    ".empty{display:flex;height:100%;align-items:center;justify-content:center;color:#64748b;font-size:14px;padding:24px;text-align:center}.ft{font-size:11px;color:#64748b;padding:4px 12px;background:#f8fafc;border-top:1px solid #e2e8f0}" +
+    "</style></head><body>" +
+    '<div class="hd"><span class="chip ' + st + '">' + ({ done: "Attached", todo: "Needs receipt", skip: "No receipt needed" })[st] + '</span><span class="t">' + esc(title) + "</span>" +
+    (line && line.amount !== null && line.amount !== undefined ? '<span class="m"><b>' + esc(money(line.amount)) + "</b></span>" : "") +
+    (line ? '<span class="m">' + (line.date ? esc(line.date) + " · " : "") + "page " + line.page + "</span>" : "") + "</div>" +
+    (line && line.note ? '<div class="note">📝 ' + esc(line.note) + "</div>" : "") + tabs +
+    '<div class="wrap">' + frames + empty + "</div>" +
+    (atts.length ? '<div class="ft">' + esc(atts[0].name) + ' · <a href="' + esc(atts[0].url) + '" target="_blank">open in new tab</a></div>' : "") +
+    "<script>function show(i){document.querySelectorAll('.doc').forEach(function(d,k){d.style.display=k===i?'flex':'none'});document.querySelectorAll('.tab').forEach(function(t,k){t.classList.toggle('on',k===i)});var f=document.querySelector('.ft');if(f){var a=" + JSON.stringify(atts.map(a => [a.name, a.url])) + "[i];f.innerHTML=a[0].replace(/</g,'&lt;')+' · <a href=\"'+a[1]+'\" target=\"_blank\">open in new tab</a>'}}<\/script>" +
+    "</body></html>";
+  try { w.document.open(); w.document.write(html); w.document.close(); } catch (e) {}
 }
 
 function LinkModal({ url, onClose }) {
@@ -1166,11 +1254,34 @@ function StatementView({ statement, session, fs, onBack, toast, readOnly }) {
   }
   function hidePreviewSoon() {
     clearTimeout(closeTimer.current);
+    if (popOpen()) return;                                // popped out: keep showing the last line
     closeTimer.current = setTimeout(() => setPreview(p => (p && p.pinned) ? p : null), 350);
   }
   function pinPreview(l) { clearTimeout(closeTimer.current); setPreview({ id: l.id, pinned: true }); }
   function closePreview() { clearTimeout(closeTimer.current); setPreview(null); }
   const previewLine = preview ? (lines || []).find(l => l.id === preview.id) : null;
+
+  // Pop-out window: once opened (needs a click), every hovered line is shown in it.
+  const popRef = useRef(null);
+  const [popped, setPopped] = useState(false);
+  const popOpen = () => !!(popRef.current && !popRef.current.closed);
+  function popOut() {
+    const w = openPopout();
+    if (!w) { toast("The browser blocked the pop-up window. Allow pop-ups for this site and try again.", "err"); return; }
+    popRef.current = w; setPopped(true);
+    renderPopout(w, previewLine);
+  }
+  function bringBack() { try { if (popRef.current) popRef.current.close(); } catch (e) {} popRef.current = null; setPopped(false); }
+  useEffect(() => {
+    if (!popOpen()) { if (popped) setPopped(false); return; }
+    renderPopout(popRef.current, previewLine);
+  }, [previewLine && previewLine.id, previewLine && (previewLine.attachments || []).length, previewLine && previewLine.note, previewLine && previewLine.desc]);
+  useEffect(() => {
+    if (!popped) return;
+    const t = setInterval(() => { if (!popOpen()) { popRef.current = null; setPopped(false); } }, 1000);
+    return () => clearInterval(t);
+  }, [popped]);
+  useEffect(() => () => { try { if (popRef.current) popRef.current.close(); } catch (e) {} }, []);
 
   async function getLink() {
     try {
@@ -1182,9 +1293,9 @@ function StatementView({ statement, session, fs, onBack, toast, readOnly }) {
 
   return (
     <div>
-      {previewLine && <BigPreview line={previewLine} pinned={preview.pinned}
+      {previewLine && !popped && <PreviewWindow line={previewLine} pinned={preview.pinned}
                                   onEnter={() => clearTimeout(closeTimer.current)} onLeave={() => { if (!preview.pinned) hidePreviewSoon(); }}
-                                  onClose={closePreview} />}
+                                  onClose={closePreview} onPopOut={popOut} />}
       {linkUrl && <LinkModal url={linkUrl} onClose={() => setLinkUrl(null)} />}
       {active && <LinePanel statement={statement} line={{ ...active, reading: !!reading[active.id] }} lines={lines} session={session} fs={fs}
                             onClose={() => setActiveId(null)} toast={toast} />}
@@ -1209,6 +1320,7 @@ function StatementView({ statement, session, fs, onBack, toast, readOnly }) {
           </div>
           <button onClick={() => setShowList(s => !s)} className="rounded-lg border bg-white px-3 py-1.5 text-xs text-slate-700">{showList ? "Hide list" : "Show list"}</button>
           <button onClick={exportCsv} className="rounded-lg border bg-white px-3 py-1.5 text-xs text-slate-700">Export CSV</button>
+          {popped && <button onClick={bringBack} className="rounded-lg border border-[#2a5f9e] bg-[#eaf1fb] px-3 py-1.5 text-xs text-[#2a5f9e]" title="Close the separate preview window">Preview popped out · bring back</button>}
           {!readOnly && <button onClick={getLink} className="rounded-lg bg-[#2a5f9e] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#234f84]">Done · get link</button>}
           {readOnly && <a href={location.pathname} className="text-xs text-[#2a5f9e] hover:underline">Sign in to edit</a>}
         </div>
@@ -1225,7 +1337,7 @@ function StatementView({ statement, session, fs, onBack, toast, readOnly }) {
           )}
           {lines !== null && readOnly && (
             <div className="rounded-xl border border-[#2a5f9e]/30 bg-[#eaf1fb] p-3 text-sm text-slate-700">
-              Hover a highlighted line to see its documents. Click the line to keep the preview open; scroll inside it.
+              Hover a highlighted line to see its documents in the preview window — drag it anywhere, resize it from the corner, or “Pop out” to put it on another screen. Click a line to keep the preview open.
             </div>
           )}
           {lines !== null && pages.map(p => (
